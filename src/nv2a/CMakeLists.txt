@@ -17,6 +17,7 @@ add_library(xbox_nv2a STATIC
     kelvin/kelvin_pgraph.c
     kelvin/kelvin_render.c
     kelvin/kelvin_gpu.c
+    kelvin/kelvin_rt.c
     kelvin/kelvin_vsh.c
     kelvin/kelvin_pixel.c
     kelvin/kelvin_texture.c

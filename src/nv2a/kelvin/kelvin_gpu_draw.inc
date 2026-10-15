@@ -57,6 +57,11 @@ typedef struct KgDc {
     uint64_t tex_epoch, tex_surfgen;
 } KgDc;
 
+/* Ray tracing capture (kelvin_gpu_rt.inc, included after this file). */
+static bool kg_rtc_begin(const KGpuDraw *d, const KgDc *dc, KGpuVs *ve, float zmax);
+static void kg_rtc_end(void);
+static void kg_rtc_note_draw(const KPixelState *ps, const KGpuSurf *cs);
+
 static KgBound s_bd;
 static KgDc s_dc;
 static void kg_bound_reset(void)
@@ -348,6 +353,8 @@ static void kgpu_draw_now(const KGpuDraw *d)
     void *p;
     long long prof_t;
     bool new_t, new_ps, cull_changed;
+    KGpuVs *rt_ve = NULL;
+    bool rt_cap;
     bool short_idx = d->index_limit && d->index_limit <= 0xFFFFu;
     D3D11_PRIMITIVE_TOPOLOGY topo = d->topology == KG_TOPO_STRIP ? D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP
                                                                    : D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
@@ -428,6 +435,7 @@ static void kgpu_draw_now(const KGpuDraw *d)
         if (dc->reject == 1) G.skipped++;
         return;
     }
+    kg_rtc_note_draw(ps, dc->cs);
     kg_post_note_draw(ps, dc->cs, dc->zs);       /* the picture effects run when the HUD begins (kelvin_gpu_post.inc) */
     if (dc->zs) {
         if (ps->depth_write || ps->stencil_write) dc->zs->real = true;
@@ -714,6 +722,7 @@ static void kgpu_draw_now(const KGpuDraw *d)
         if (d->gvs) {
             KGpuVs *ve = vs_lookup(d->gvs->program, d->gvs->hash, d->gvs->start, NULL, 0);
             if (!ve || !ve->vs) return;
+            rt_ve = ve;
             if (b->vs != ve->vs) {
                 ID3D11DeviceContext_VSSetShader(G.ctx, ve->vs, NULL, 0);
                 b->vs = ve->vs;
@@ -773,7 +782,9 @@ static void kgpu_draw_now(const KGpuDraw *d)
         ki.ntex = (uint8_t)nt; ki.tex0w = ps->tex[0].width; ki.tex0h = ps->tex[0].height;
         kp_mark(&ki);
     }
+    rt_cap = kg_rtc_begin(d, dc, rt_ve, dc->zmax);
     ID3D11DeviceContext_DrawIndexed(G.ctx, d->icount, (UINT)(short_idx ? ib_at * 2 : ib_at), 0);
+    if (rt_cap) kg_rtc_end();
     if (s_kp_mode != 0) kp_done();
     g_kgpu_ticks[KGP_DRAW] += kg_tick() - prof_t;
     if (s_dl.mode != 0) kg_dl_draw(d);

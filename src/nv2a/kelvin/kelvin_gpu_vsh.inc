@@ -445,7 +445,25 @@ typedef struct KGpuVs {
     uint32_t *words;                   /* microcode up to the final instruction, for the manifest */
     uint32_t nwords;
     unsigned env;                      /* the stages its texture coordinates give environment maps (vsh_env_stages) */
+    ID3D11GeometryShader *volatile so_gs; /* ray tracing: the same program streaming its triangles out (kelvin_gpu_rt.inc) */
 } KGpuVs;
+
+/* A vertex shader's outputs streamed as they are rasterised: position, diffuse colour and the first two texture
+ * coordinate sets, 64 bytes a vertex. Made from the vertex shader's own bytecode, so it is a pass-through stage. */
+#define KG_SO_STRIDE 64u
+static void vs_make_so(KGpuVs *e, const void *code, size_t n)
+{
+    static const D3D11_SO_DECLARATION_ENTRY decl[4] = {
+        { 0, "SV_POSITION", 0, 0, 4, 0 }, { 0, "TEXCOORD", 0, 0, 4, 0 },
+        { 0, "TEXCOORD", 3, 0, 4, 0 }, { 0, "TEXCOORD", 4, 0, 4, 0 },
+    };
+    const UINT stride = KG_SO_STRIDE;
+    ID3D11GeometryShader *gs = NULL;
+    if (e->so_gs || !krt_available()) return;
+    if (FAILED(ID3D11Device_CreateGeometryShaderWithStreamOutput(G.dev, code, (SIZE_T)n, decl, 4, &stride, 1, 0, NULL, &gs)))
+        return;
+    if (InterlockedCompareExchangePointer((PVOID volatile *)&e->so_gs, gs, NULL) != NULL) ID3D11GeometryShader_Release(gs);
+}
 
 #define KG_VS_MAX 512
 static KGpuVs s_vs[KG_VS_MAX];
@@ -530,6 +548,7 @@ static bool vs_try_cache(KGpuVs *e)
     }
     if (!buf) return false;
     if (FAILED(ID3D11Device_CreateVertexShader(G.dev, buf, (SIZE_T)n, NULL, &vs))) vs = NULL;
+    if (vs) vs_make_so(e, buf, (size_t)n);
     free(buf);
     e->vs = vs;
     return vs != NULL;
@@ -640,6 +659,7 @@ static void vs_compile(KGpuVs *e, bool quick)
             char path[512];
             vs_cache_path(path, sizeof(path), e->sh, e->len);
             kg_write_file(path, ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code));
+            vs_make_so(e, ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code));
             InterlockedExchangePointer((PVOID volatile *)&e->vs, vs);
             InterlockedExchange(&e->state, 1);
             manifest_add(e);

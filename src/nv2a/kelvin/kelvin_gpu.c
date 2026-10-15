@@ -10,6 +10,7 @@
 #include <d3d11_4.h>
 #include <dxgi1_4.h>
 #include <d3dcompiler.h>
+#include "kelvin_rt.h"
 #include <intrin.h>
 #include <nmmintrin.h>
 #include <tlhelp32.h>
@@ -463,6 +464,7 @@ bool kgpu_init(void)
     IDXGIAdapter1_Release(best);
     if (FAILED(hr)) { fprintf(stderr, "[KGPU] D3D11CreateDevice failed 0x%08lX\n", (unsigned long)hr); return false; }
     ID3D11DeviceContext_QueryInterface(G.ctx, &IID_ID3D11DeviceContext1, (void **)&G.ctx1);
+    if (getenv("RECOMP_KGPU_RT")) krt_init(G.dev, G.ctx, best_luid);
 
     vsb = compile_hlsl(kgpu_hlsl_common, kgpu_hlsl_vs, "vs_main", "vs_5_0");
     psb = compile_hlsl(kgpu_hlsl_common, kgpu_hlsl_ps, "ps_main", "ps_5_0");
@@ -1460,6 +1462,7 @@ static void write_bmp(const char *path, const uint8_t *bgra, unsigned int w, uns
 #include "kelvin_gpu_post.inc"
 #include "kelvin_gpu_ssr.inc"
 #include "kelvin_gpu_draw.inc"
+#include "kelvin_gpu_rt.inc"
 
 /* ---- clears ------------------------------------------------------------------------------------- */
 
@@ -1995,6 +1998,7 @@ static void kg_apply_pending_size(void)
 
 static void kgpu_flip_now(const KelvinTarget *t, unsigned int color_format, uint32_t aspect_w, uint32_t aspect_h)
 {
+    kg_rtc_before_flip();
     kg_post_before_flip(t, color_format);
     kgpu_flip_inner(t, color_format, aspect_w, aspect_h);
     kg_post_after_flip();
