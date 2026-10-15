@@ -3700,13 +3700,13 @@ def lift_basic_block(lifter, bb, flag_state=None):
             pass  # SETcc doesn't set flags
         elif curr.mnemonic.startswith("rep"):
             # rep movsb/movsd = data copy, preserves flags
-            # repe cmpsb/repne scasb = comparison, sets flags
+            # repe cmps*/repne scas* (any width) = comparison, sets flags
             rest = curr.op_str.strip() if hasattr(curr, 'op_str') else ""
             raw_m = curr.mnemonic
-            if "cmpsb" in raw_m or "scasb" in raw_m:
+            if "cmps" in raw_m or "scas" in raw_m:
                 last_flag_setter = raw_m
                 last_flag_ops = list(curr.operands)
-            elif "cmpsb" in rest or "scasb" in rest:
+            elif "cmps" in rest or "scas" in rest:
                 last_flag_setter = raw_m
                 last_flag_ops = list(curr.operands)
             else:

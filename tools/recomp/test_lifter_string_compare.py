@@ -77,6 +77,30 @@ class StringCompareLifterTest(unittest.TestCase):
         self.assertIn("_flags", jcc)
         self.assertNotIn("_fa", jcc)
 
+    def test_dword_compare_replaces_an_earlier_flag_setter(self):
+        # BLACK's gamma ramp update: xor ebx, ebx; repe cmpsd; je. The je
+        # read the xor's result (always zero), so the ramp was never copied.
+        clear = Instruction(0, 2, "xor", "ebx, ebx", "33db")
+        clear.operands = [Operand(type="reg", reg="ebx"), Operand(type="reg", reg="ebx")]
+        compare = Instruction(
+            2, 2, "repe cmpsd", "dword ptr [esi], dword ptr es:[edi]",
+            "f3a7")
+        compare.operands = [
+            Operand(type="mem", mem_base="esi", mem_size=4),
+            Operand(type="mem", mem_base="edi", mem_size=4),
+        ]
+        jump = Instruction(4, 2, "je", "0x10", "740a")
+        jump.jump_target = 0x10
+        lifter = Lifter()
+        lifter.func_start = 0
+        lifter.func_end = 0x20
+
+        lifted, _ = lift_basic_block(
+            lifter, BasicBlock(start=0, instructions=[clear, compare, jump]))
+        jcc = "\n".join(lifted).splitlines()[-1]
+        self.assertIn("_flags", jcc)
+        self.assertNotIn("_fa", jcc)
+
 
 if __name__ == "__main__":
     unittest.main()

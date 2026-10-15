@@ -41,6 +41,8 @@ typedef struct FbGpu {
     ID3D11Texture2D *shared_tex[8]; ID3D11ShaderResourceView *shared_srv[8];
     LONG shared_gen;
     uint64_t done_signaled;
+    ID3D11Texture2D *ramp_tex; ID3D11ShaderResourceView *ramp_view;
+    LONG ramp_gen;
     /* the Video Settings page and its hint, drawn over the frame */
     ID3D11PixelShader *ovl_ps; ID3D11BlendState *ovl_blend;
     ID3D11Texture2D *ovl_tex; ID3D11ShaderResourceView *ovl_view;
@@ -73,6 +75,10 @@ static uint32_t s_pin_va;
 static const char *s_dump;
 static RECT s_window_rect;
 
+static SRWLOCK s_ramp_lock = SRWLOCK_INIT;
+static uint32_t s_ramp[256];                /* R8G8B8A8, entry i at i */
+static volatile LONG s_ramp_gen;
+
 static unsigned s_applied_w, s_applied_h;   /* the window size last set from the settings */
 static const char *s_menu_shot;             /* RECOMP_VIDEO_MENU_SHOT: dump the back buffer whenever the page changes */
 static unsigned s_menu_shots;
@@ -94,6 +100,10 @@ static BOOL CALLBACK fb_initialize(PINIT_ONCE once, PVOID arg, PVOID *context)
 {
     const char *pin;
     (void)once; (void)arg; (void)context;
+    {
+        unsigned i;
+        for (i = 0; i < 256; ++i) s_ramp[i] = 0xFF000000u | i << 16 | i << 8 | i;
+    }
     s_enabled = getenv("RECOMP_FB_WINDOW") != NULL;
     {
         PcVideoSettings v;
@@ -108,6 +118,25 @@ static BOOL CALLBACK fb_initialize(PINIT_ONCE once, PVOID arg, PVOID *context)
     if (s_menu_shot && !*s_menu_shot) s_menu_shot = NULL;
     if (s_enabled) s_frame_ready = CreateEventA(NULL, FALSE, FALSE, NULL);
     return TRUE;
+}
+void xbox_FramebufferGammaEntry(unsigned index, uint8_t red, uint8_t green, uint8_t blue)
+{
+    const uint32_t entry = 0xFF000000u | (uint32_t)blue << 16 | (uint32_t)green << 8 | red;
+    InitOnceExecuteOnce(&s_once, fb_initialize, NULL, NULL);
+    if (index >= 256) return;
+    AcquireSRWLockExclusive(&s_ramp_lock);
+    if (s_ramp[index] != entry) { s_ramp[index] = entry; InterlockedIncrement(&s_ramp_gen); }
+    ReleaseSRWLockExclusive(&s_ramp_lock);
+}
+void xbox_FramebufferGammaRamp(const uint8_t *red, const uint8_t *green, const uint8_t *blue)
+{
+    uint32_t ramp[256];
+    unsigned i;
+    InitOnceExecuteOnce(&s_once, fb_initialize, NULL, NULL);
+    for (i = 0; i < 256; ++i) ramp[i] = 0xFF000000u | (uint32_t)blue[i] << 16 | (uint32_t)green[i] << 8 | red[i];
+    AcquireSRWLockExclusive(&s_ramp_lock);
+    if (memcmp(s_ramp, ramp, sizeof(ramp)) != 0) { memcpy(s_ramp, ramp, sizeof(ramp)); InterlockedIncrement(&s_ramp_gen); }
+    ReleaseSRWLockExclusive(&s_ramp_lock);
 }
 /* Legacy display-mode calls precede any completed pixels; do not sample RAM. */
 void xbox_FramebufferWindowSet(uint32_t va, uint32_t pitch) { (void)va; (void)pitch; }
@@ -569,6 +598,7 @@ static void fb_gpu_close(FbGpu *g)
     { unsigned i; for (i = 0; i < FB_GPU_SLOTS; ++i) { FB_RELEASE(g->shared_srv[i]); FB_RELEASE(g->shared_tex[i]); } }
     FB_RELEASE(g->frame_fence); FB_RELEASE(g->done_fence); FB_RELEASE(g->ctx4);
     FB_RELEASE(g->ovl_view); FB_RELEASE(g->ovl_tex); FB_RELEASE(g->ovl_blend); FB_RELEASE(g->ovl_ps);
+    FB_RELEASE(g->ramp_view); FB_RELEASE(g->ramp_tex);
     FB_RELEASE(g->raster); FB_RELEASE(g->point); FB_RELEASE(g->linear); FB_RELEASE(g->ps); FB_RELEASE(g->vs); FB_RELEASE(g->vs_cinematic);
     FB_RELEASE(g->view); FB_RELEASE(g->texture); FB_RELEASE(g->target); FB_RELEASE(g->swap);
     FB_RELEASE(g->context); FB_RELEASE(g->device);
@@ -589,12 +619,15 @@ done:
 static HRESULT fb_gpu_open(FbGpu *g, HWND hwnd)
 {
     static const char shader[] =
-        "Texture2D image:register(t0); SamplerState filter:register(s0);"
+        "Texture2D image:register(t0); Texture2D ramp:register(t1);"
+        "SamplerState filter:register(s0); SamplerState smooth:register(s1);"
         "struct V{float4 p:SV_Position;float2 uv:TEXCOORD0;};"
         "V vs(uint i:SV_VertexID){V v;float2 uv=float2((i<<1)&2,i&2);"
         "v.p=float4(uv.x*2-1,1-uv.y*2,0,1);v.uv=uv;return v;}"
         "V vs_cinematic(uint i:SV_VertexID){V v=vs(i);v.uv.y=(v.uv.y*352+64)/480;return v;}"
-        "float4 ps(V v):SV_Target{return float4(image.Sample(filter,v.uv).rgb,1);}"
+        "float4 ps(V v):SV_Target{float3 c=saturate(image.Sample(filter,v.uv).rgb)*(255.0/256)+0.5/256;"
+        "return float4(ramp.SampleLevel(smooth,float2(c.r,0.5),0).r,ramp.SampleLevel(smooth,float2(c.g,0.5),0).g,"
+        "ramp.SampleLevel(smooth,float2(c.b,0.5),0).b,1);}"
         "float4 ps_ovl(V v):SV_Target{return image.Sample(filter,v.uv);}";
     IDXGIDevice *dxgi_device = NULL; IDXGIAdapter *adapter = NULL;
     IDXGIFactory2 *factory = NULL; IDXGIFactory5 *factory5 = NULL;
@@ -661,6 +694,15 @@ static HRESULT fb_gpu_open(FbGpu *g, HWND hwnd)
     FB_TRY(ID3D11Device_CreateSamplerState(g->device, &sampler, &g->point));
     raster.FillMode = D3D11_FILL_SOLID; raster.CullMode = D3D11_CULL_NONE; raster.DepthClipEnable = TRUE;
     FB_TRY(ID3D11Device_CreateRasterizerState(g->device, &raster, &g->raster));
+    {
+        D3D11_TEXTURE2D_DESC desc = {0};
+        desc.Width = 256; desc.Height = 1; desc.MipLevels = desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT; desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        FB_TRY(ID3D11Device_CreateTexture2D(g->device, &desc, NULL, &g->ramp_tex));
+        FB_TRY(ID3D11Device_CreateShaderResourceView(g->device, (ID3D11Resource *)g->ramp_tex, NULL, &g->ramp_view));
+        g->ramp_gen = InterlockedCompareExchange(&s_ramp_gen, 0, 0) - 1;
+    }
 done:
     if (FAILED(hr) && errors) fprintf(stderr, "[FBWIN] shader: %s\n", (char *)errors->lpVtbl->GetBufferPointer(errors));
     FB_RELEASE(errors); FB_RELEASE(ps_ovl); FB_RELEASE(ps); FB_RELEASE(vs); FB_RELEASE(vs_cinematic); FB_RELEASE(factory5); FB_RELEASE(factory);
@@ -788,6 +830,15 @@ static HRESULT fb_gpu_draw(FbGpu *g, const FbFrame *frame)
             frame->pixels, frame->width * 4, 0);
         view = g->view;
     }
+    {
+        const LONG gen = InterlockedCompareExchange(&s_ramp_gen, 0, 0);
+        if (gen != g->ramp_gen) {
+            uint32_t ramp[256];
+            AcquireSRWLockShared(&s_ramp_lock); memcpy(ramp, s_ramp, sizeof(ramp)); ReleaseSRWLockShared(&s_ramp_lock);
+            ID3D11DeviceContext_UpdateSubresource(g->context, (ID3D11Resource *)g->ramp_tex, 0, NULL, ramp, sizeof(ramp), 0);
+            g->ramp_gen = gen;
+        }
+    }
     ID3D11DeviceContext_OMSetRenderTargets(g->context, 1, &g->target, NULL);
     ID3D11DeviceContext_ClearRenderTargetView(g->context, g->target, black);
     viewport.TopLeftX = (FLOAT)r.x; viewport.TopLeftY = (FLOAT)r.y;
@@ -799,6 +850,8 @@ static HRESULT fb_gpu_draw(FbGpu *g, const FbFrame *frame)
         fb_cinematic_crop(frame->aspect_w, frame->aspect_h) ? g->vs_cinematic : g->vs, NULL, 0);
     ID3D11DeviceContext_PSSetShader(g->context, g->ps, NULL, 0);
     ID3D11DeviceContext_PSSetSamplers(g->context, 0, 1, &sampler);
+    ID3D11DeviceContext_PSSetSamplers(g->context, 1, 1, &g->linear);
+    ID3D11DeviceContext_PSSetShaderResources(g->context, 1, 1, &g->ramp_view);
     ID3D11DeviceContext_PSSetShaderResources(g->context, 0, 1, &view); ID3D11DeviceContext_Draw(g->context, 3, 0);
     if (g->overlay_on && g->ovl_view && g->ovl_ps && g->ovl_blend) {
         const FLOAT factor[4] = {0, 0, 0, 0};
@@ -901,6 +954,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         fb_capture_update(hwnd);
         latest = fb_take_latest(); if (latest != frame) { frame = latest; need_draw = 1; }
         if (InterlockedExchange(&s_redraw, 0)) need_draw = 1;
+        if (InterlockedCompareExchange(&s_ramp_gen, 0, 0) != gpu.ramp_gen) need_draw = 1;
         QueryPerformanceCounter(&now);
         if (need_draw && frame && now.QuadPart >= next.QuadPart && !IsIconic(hwnd)) {
             RECT client; GetClientRect(hwnd, &client);
@@ -980,4 +1034,6 @@ void xbox_FramebufferMoviePublish(uint64_t t, const void *s, size_t n, uint32_t 
     uint32_t h, uint32_t p, uint32_t a, uint32_t b) { (void)t; (void)s; (void)n; (void)w; (void)h; (void)p; (void)a; (void)b; }
 void xbox_FramebufferMovieEnd(uint64_t t) { (void)t; }
 void xbox_FramebufferInputByCaller(int on) { (void)on; }
+void xbox_FramebufferGammaEntry(unsigned i, uint8_t r, uint8_t g, uint8_t b) { (void)i; (void)r; (void)g; (void)b; }
+void xbox_FramebufferGammaRamp(const uint8_t *r, const uint8_t *g, const uint8_t *b) { (void)r; (void)g; (void)b; }
 #endif

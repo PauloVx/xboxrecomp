@@ -10,6 +10,8 @@
 
 #include "nv2a_state.h"
 #include "nv2a_pgraph_d3d11.h"
+#include "nv2a_dac.h"
+#include "../video/fb_present.h"
 
 /* ============================================================
  * Global state
@@ -475,6 +477,69 @@ void pramdac_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 }
 
 /* ============================================================
+ * PRMDIO - the VGA DAC palette (nv2a_dac.h). The presenter applies it.
+ * ============================================================ */
+
+static struct {
+    uint8_t lut[256][3];
+    uint8_t write_index, write_component, read_index, read_component;
+} s_dac;
+
+void nv2a_dac_write(uint32_t offset, uint8_t value)
+{
+    switch (offset) {
+    case 0x3C7:
+        s_dac.read_index = value; s_dac.read_component = 0;
+        break;
+    case 0x3C8:
+        s_dac.write_index = value; s_dac.write_component = 0;
+        break;
+    case 0x3C9:
+        s_dac.lut[s_dac.write_index][s_dac.write_component] = value;
+        if (++s_dac.write_component == 3) {
+            const uint8_t *e = s_dac.lut[s_dac.write_index];
+            xbox_FramebufferGammaEntry(s_dac.write_index, e[0], e[1], e[2]);
+            s_dac.write_component = 0;
+            s_dac.write_index++;
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+uint8_t nv2a_dac_read(uint32_t offset)
+{
+    uint8_t v;
+    switch (offset) {
+    case 0x3C8:
+        return s_dac.write_index;
+    case 0x3C9:
+        v = s_dac.lut[s_dac.read_index][s_dac.read_component];
+        if (++s_dac.read_component == 3) { s_dac.read_component = 0; s_dac.read_index++; }
+        return v;
+    default:
+        return 0;
+    }
+}
+
+static uint64_t prmdio_read(void *opaque, hwaddr addr, unsigned int size)
+{
+    uint64_t v = 0;
+    unsigned i;
+    (void)opaque;
+    for (i = 0; i < size; i++) v |= (uint64_t)nv2a_dac_read((uint32_t)addr + i) << (i * 8);
+    return v;
+}
+
+static void prmdio_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
+{
+    unsigned i;
+    (void)opaque;
+    for (i = 0; i < size; i++) nv2a_dac_write((uint32_t)addr + i, (uint8_t)(val >> (i * 8)));
+}
+
+/* ============================================================
  * PVIDEO - video overlay (stub)
  * ============================================================ */
 
@@ -705,7 +770,7 @@ const NV2ABlockInfo blocktable[NV_NUM_BLOCKS] = {
     ENTRY(PCRTC,    pcrtc,    0x600000, 0x001000),
     STUB_ENTRY(PRMCIO,        0x601000, 0x001000),
     ENTRY(PRAMDAC,  pramdac,  0x680000, 0x001000),
-    STUB_ENTRY(PRMDIO,        0x681000, 0x001000),
+    ENTRY(PRMDIO,   prmdio,   0x681000, 0x001000),
     /* NV_PRAMIN = 19 */
     { .name = NULL },
     /* NV_USER = 20 */
