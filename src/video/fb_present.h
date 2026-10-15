@@ -52,6 +52,12 @@ void xbox_FramebufferMovieEnd(uint64_t token);
 /* Nonzero while a movie owns the presenter (Escape then belongs to the movie's own skip). */
 int xbox_FramebufferMovieActive(void);
 
+/* One entry of the display's colour lookup (the gamma ramp the game writes to the DAC palette). Every presented frame
+ * goes through it; until the game writes one it is the identity. */
+void xbox_FramebufferGammaEntry(unsigned index, uint8_t red, uint8_t green, uint8_t blue);
+/* The whole lookup at once (256 entries per channel), for a title that hands it over without the DAC's 768 writes. */
+void xbox_FramebufferGammaRamp(const uint8_t *red, const uint8_t *green, const uint8_t *blue);
+
 /* Asks the presenter's window to close, as its close button does (the game exits with 0). 0 = no window. */
 int xbox_FramebufferRequestClose(void);
 

@@ -39,16 +39,20 @@
 #include "kelvin_int.h"
 #include "kelvin.h"
 #include "platform/mmio_decode.h"
+#include "../nv2a_dac.h"
 
 #define PMC_BASE     0x000000u
 #define PMC_SIZE     0x1000u
 #define PGRAPH_SIZE  0x2000u
 #define PCRTC_BASE   0x600000u
 #define PCRTC_SIZE   0x1000u
+#define PRMDIO_BASE  0x681000u
+#define PRMDIO_SIZE  0x1000u
 
 static uint32_t s_pmc[PMC_SIZE / 4];
 static uint32_t s_pgraph[PGRAPH_SIZE / 4];
 static uint32_t s_pcrtc[PCRTC_SIZE / 4];
+static uint32_t s_prmdio[PRMDIO_SIZE / 4];
 static uint32_t s_pcrtc_raster;
 
 static KelvinState *s_pg;
@@ -369,7 +373,8 @@ static bool owned(uint32_t off)
 {
     return off - PMC_BASE < PMC_SIZE ||
            off - KELVIN_PGRAPH_BASE < PGRAPH_SIZE ||
-           off - PCRTC_BASE < PCRTC_SIZE;
+           off - PCRTC_BASE < PCRTC_SIZE ||
+           off - PRMDIO_BASE < PRMDIO_SIZE;
 }
 
 int kelvin_owns_register(unsigned int offset)
@@ -418,6 +423,12 @@ static uint64_t access_read(void *dev, uint32_t off, int size)
     uint64_t v;
     (void)dev;
 
+    if (off - PRMDIO_BASE < PRMDIO_SIZE) {
+        /* byte registers, and reading 0x3C9 advances the palette: only the bytes accessed */
+        int i;
+        for (v = 0, i = 0; i < size; i++) v |= (uint64_t)nv2a_dac_read(off - PRMDIO_BASE + i) << (i * 8);
+        return v;
+    }
     if (size == 8) {
         return reg_read(off & ~3u) | ((uint64_t)reg_read((off & ~3u) + 4) << 32);
     }
@@ -431,6 +442,11 @@ static void access_write(void *dev, uint32_t off, uint64_t val, int size)
     uint32_t mask;
     (void)dev;
 
+    if (off - PRMDIO_BASE < PRMDIO_SIZE) {
+        int i;
+        for (i = 0; i < size; i++) nv2a_dac_write(off - PRMDIO_BASE + i, (uint8_t)(val >> (i * 8)));
+        return;
+    }
     if (size == 8) {
         reg_write(off & ~3u, (uint32_t)val, 0xFFFFFFFFu);
         reg_write((off & ~3u) + 4, (uint32_t)(val >> 32), 0xFFFFFFFFu);
@@ -511,6 +527,7 @@ bool kelvin_mmio_start(KelvinState *pg)
         { PMC_BASE, PMC_SIZE, s_pmc },
         { KELVIN_PGRAPH_BASE, PGRAPH_SIZE, s_pgraph },
         { PCRTC_BASE, PCRTC_SIZE, s_pcrtc },
+        { PRMDIO_BASE, PRMDIO_SIZE, s_prmdio },
     };
     size_t i;
     DWORD old;
@@ -545,7 +562,7 @@ bool kelvin_mmio_start(KelvinState *pg)
         }
     }
     InterlockedExchange(&s_trapped, 1);
-    fprintf(stderr, "[KELVIN] PMC, PGRAPH and PCRTC registers trapped"
+    fprintf(stderr, "[KELVIN] PMC, PGRAPH, PCRTC and palette registers trapped"
                     " (interrupt status, enables and triggers modelled)\n");
     fflush(stderr);
     return true;
