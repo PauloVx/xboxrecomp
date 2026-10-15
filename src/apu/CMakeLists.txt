@@ -17,15 +17,15 @@ add_library(xbox_apu STATIC
 target_include_directories(xbox_apu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 # DSP56300 is a separately maintained MIT-licensed Rust core with a C ABI.
-# Keep its source pinned by scripts/setup.ps1; build the static library into
+# Its source is the third_party/dsp56300 submodule of the game project; build the static library into
 # this CMake tree so the runtime and standalone APU tests use the same engine.
 get_filename_component(BLACK_PROJECT_ROOT
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../" ABSOLUTE)
-set(DSP56300_SOURCE_DIR "${BLACK_PROJECT_ROOT}/.work/err009-dsp56300" CACHE PATH
+set(DSP56300_SOURCE_DIR "${BLACK_PROJECT_ROOT}/third_party/dsp56300" CACHE PATH
     "Pinned DSP56300 source checkout")
 if(NOT EXISTS "${DSP56300_SOURCE_DIR}/crates/emu-ffi/Cargo.toml")
     message(FATAL_ERROR
-        "Pinned DSP56300 source is missing. Run scripts/setup.ps1 first.")
+        "Pinned DSP56300 source is missing. Run: git submodule update --init --recursive")
 endif()
 find_program(CARGO_EXECUTABLE NAMES cargo cargo.exe)
 if(NOT CARGO_EXECUTABLE)
