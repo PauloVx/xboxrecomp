@@ -43,7 +43,19 @@ static struct {
     bool overflow, done;
     float c58[4], c59[4], scale[4];
     unsigned frames, check;
+    ID3D11Texture2D *out;               /* what the D3D12 passes wrote, at the raster size */
+    ID3D11ShaderResourceView *out_srv;
+    HANDLE out_h;
+    unsigned out_w, out_hh;
+    ID3D11PixelShader *ps_view;
+    bool view;                          /* RECOMP_KGPU_RT_VIEW=1 */
+    uint32_t first[KRT_DRAWS_MAX], count[KRT_DRAWS_MAX];
+    uint8_t opaque[KRT_DRAWS_MAX];
 } s_rtc;
+
+static const char kg_rtc_view_hlsl[] =
+    "Texture2D<float4> rt : register(t0);\n"
+    "float4 main(float4 p : SV_Position) : SV_Target { return float4(rt.Load(int3(p.xy, 0)).rgb, 1.0); }\n";
 
 static const char kg_rtc_hlsl[] =
     "ByteAddressBuffer so : register(t0);\n"
@@ -116,6 +128,13 @@ static bool kg_rtc_setup(void)
     if (!make_buffer(sizeof(KrtCb), D3D11_BIND_CONSTANT_BUFFER, &s_rtc.cb)) return false;
     e = getenv("RECOMP_KGPU_RT_CHECK");
     s_rtc.check = e && *e && *e != '0';
+    e = getenv("RECOMP_KGPU_RT_VIEW");
+    s_rtc.view = e && *e && *e != '0';
+    code = compile_hlsl("", kg_rtc_view_hlsl, "main", "ps_5_0");
+    if (code) {
+        ID3D11Device_CreatePixelShader(G.dev, ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code), NULL, &s_rtc.ps_view);
+        ID3D10Blob_Release(code);
+    }
     fprintf(stderr, "[KRT] geometry capture on: up to %u vertices a frame\n", KRT_SO_VERTS);
     return true;
 }
@@ -268,14 +287,45 @@ static void kg_rtc_check(const float *vp)
             s_rtc.ndraws, s_rtc.used / 3, s_rtc.overflow ? " (stream full)" : "", checked, worst);
 }
 
-/* The frame's world is drawn: turn what was captured into world space for the D3D12 side. */
-static void kg_rtc_finish(void)
+/* The texture the D3D12 passes write, at the main target's raster size; made again when that size changes. */
+static bool kg_rtc_output(unsigned w, unsigned h)
+{
+    D3D11_TEXTURE2D_DESC td;
+    IDXGIResource1 *r1 = NULL;
+    if (s_rtc.out && s_rtc.out_w == w && s_rtc.out_hh == h) return true;
+    SAFE_RELEASE(s_rtc.out_srv); SAFE_RELEASE(s_rtc.out);
+    if (s_rtc.out_h) { CloseHandle(s_rtc.out_h); s_rtc.out_h = NULL; }
+    s_rtc.out_w = s_rtc.out_hh = 0;
+    memset(&td, 0, sizeof(td));
+    td.Width = w; td.Height = h; td.MipLevels = td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+    td.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+    if (FAILED(ID3D11Device_CreateTexture2D(G.dev, &td, NULL, &s_rtc.out)) ||
+        FAILED(ID3D11Device_CreateShaderResourceView(G.dev, (ID3D11Resource *)s_rtc.out, NULL, &s_rtc.out_srv)) ||
+        FAILED(ID3D11Texture2D_QueryInterface(s_rtc.out, &IID_IDXGIResource1, (void **)&r1)) ||
+        FAILED(IDXGIResource1_CreateSharedHandle(r1, NULL, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, NULL, &s_rtc.out_h)) ||
+        !krt_set_output(s_rtc.out_h, w, h)) {
+        if (r1) IDXGIResource1_Release(r1);
+        SAFE_RELEASE(s_rtc.out_srv); SAFE_RELEASE(s_rtc.out);
+        return false;
+    }
+    IDXGIResource1_Release(r1);
+    s_rtc.out_w = w; s_rtc.out_hh = h;
+    return true;
+}
+
+/* The frame's world is drawn (cs is the main target, or NULL at a flip): turn what was captured into world space,
+ * hand it to the D3D12 side and run the passes there. */
+static void kg_rtc_finish(KGpuSurf *cs)
 {
     const float *vp;
     KrtCb cb;
+    KrtFrame f;
     D3D11_MAPPED_SUBRESOURCE ms;
     ID3D11ShaderResourceView *none_srv = NULL;
     ID3D11UnorderedAccessView *none_uav = NULL;
+    unsigned i;
     if (s_rtc.state <= 0 || s_rtc.done) return;
     s_rtc.done = true;
     if (!s_rtc.used || !(vp = kg_rtc_camera()) || !kg_rtc_invert(vp, cb.inv)) return;
@@ -295,6 +345,24 @@ static void kg_rtc_finish(void)
     ID3D11DeviceContext_CSSetUnorderedAccessViews(G.ctx, 0, 1, &none_uav, NULL);
     ID3D11DeviceContext_CSSetShader(G.ctx, NULL, NULL, 0);
     if (s_rtc.check && ++s_rtc.frames % 300 == 0) kg_rtc_check(vp);
+
+    memset(&f, 0, sizeof(f));
+    for (i = 0; i < s_rtc.ndraws; i++) {
+        s_rtc.first[i] = s_rtc.draws[i].first;
+        s_rtc.count[i] = s_rtc.draws[i].count;
+        s_rtc.opaque[i] = s_rtc.draws[i].alpha_test ? 0 : 1;
+    }
+    f.nverts = s_rtc.used; f.ndraws = s_rtc.ndraws;
+    f.first = s_rtc.first; f.count = s_rtc.count; f.opaque = s_rtc.opaque;
+    memcpy(f.inv, cb.inv, sizeof(f.inv));
+    memcpy(f.c58, cb.c58, sizeof(f.c58));
+    memcpy(f.c59, cb.c59, sizeof(f.c59));
+    f.guest_w = 2.0f / s_rtc.scale[0]; f.guest_h = 2.0f / s_rtc.scale[1];
+    f.view = s_rtc.view && cs && kg_rtc_output(cs->hw, cs->hh);
+    if (krt_frame(&f) && f.view && s_rtc.ps_view && post_init()) {
+        post_pass(s_rtc.ps_view, cs->rtv, cs->hw, cs->hh, s_rtc.out_srv, NULL, NULL, NULL);
+        kg_cache_invalidate();
+    }
 }
 
 /* Called for every draw once its surfaces are known: the HUD's first draw ends the world. */
@@ -302,12 +370,12 @@ static void kg_rtc_note_draw(const KPixelState *ps, const KGpuSurf *cs)
 {
     if (s_rtc.state > 0 && !s_rtc.done && s_rtc.ndraws >= 4 && post_main_target(cs) &&
         ps->depth_test && ps->depth_func == 7 && !ps->depth_write)
-        kg_rtc_finish();
+        kg_rtc_finish((KGpuSurf *)cs);
 }
 
 static void kg_rtc_before_flip(void)
 {
-    kg_rtc_finish();
+    kg_rtc_finish(NULL);
     s_rtc.used = 0;
     s_rtc.ndraws = 0;
     s_rtc.overflow = false;

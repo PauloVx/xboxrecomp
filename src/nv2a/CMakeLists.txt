@@ -34,6 +34,36 @@ add_library(xbox_nv2a STATIC
 # include kelvin_render.c directly keep the environment-only behaviour.
 set_source_files_properties(kelvin/kelvin_render.c PROPERTIES COMPILE_DEFINITIONS KRES_PC_VIDEO=1)
 
+# Ray tracing shaders (Direct3D 12, shader model 6.5, kelvin/rt): compiled with the Windows SDK's dxc into headers.
+# Without dxc the renderer builds without them and ray tracing stays off (kelvin_rt.c).
+if(WIN32)
+    set(_krt_pf86 "ProgramFiles(x86)")
+    file(GLOB _krt_sdk_bins "$ENV{${_krt_pf86}}/Windows Kits/10/bin/10.*/x64")
+    list(SORT _krt_sdk_bins COMPARE NATURAL ORDER DESCENDING)
+    find_program(KRT_DXC dxc HINTS ${_krt_sdk_bins})
+    if(KRT_DXC)
+        set(_krt_out ${CMAKE_CURRENT_BINARY_DIR}/krt_shaders)
+        set(_krt_headers)
+        foreach(_krt_name krt_unpack krt_view)
+            set(_krt_h ${_krt_out}/${_krt_name}.h)
+            add_custom_command(
+                OUTPUT ${_krt_h}
+                COMMAND ${CMAKE_COMMAND} -E make_directory ${_krt_out}
+                COMMAND ${KRT_DXC} -nologo -T cs_6_5 -E main -O3 -Fh ${_krt_h} -Vn ${_krt_name}_cs
+                        ${CMAKE_CURRENT_SOURCE_DIR}/kelvin/rt/${_krt_name}.hlsl
+                DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/kelvin/rt/${_krt_name}.hlsl
+                        ${CMAKE_CURRENT_SOURCE_DIR}/kelvin/rt/krt_common.hlsli
+                VERBATIM)
+            list(APPEND _krt_headers ${_krt_h})
+        endforeach()
+        target_sources(xbox_nv2a PRIVATE ${_krt_headers})
+        target_include_directories(xbox_nv2a PRIVATE ${_krt_out})
+        target_compile_definitions(xbox_nv2a PRIVATE KRT_HAVE_SHADERS=1)
+    else()
+        message(STATUS "dxc not found: the renderer is built without ray tracing")
+    endif()
+endif()
+
 target_include_directories(xbox_nv2a PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(xbox_nv2a PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
