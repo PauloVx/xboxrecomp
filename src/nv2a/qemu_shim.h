@@ -55,7 +55,7 @@ typedef uintptr_t target_ulong;
  * ============================================================ */
 
 /* For MSVC which doesn't have __builtin_ctz: */
-#ifdef _MSC_VER
+#if defined(_MSC_VER) && !defined(__clang__)
 #include <intrin.h>
 static inline int __builtin_ctz(unsigned int x) {
     unsigned long index;
