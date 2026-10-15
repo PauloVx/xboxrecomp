@@ -24,6 +24,8 @@
 #include "apu_shim.h"
 #include "apu_regs.h"
 #include "apu_debug.h"
+#include "apu_dsp_engine.h"
+#include "apu_dma.h"
 
 /* ============================================================
  * DSP CPU registers
@@ -105,36 +107,28 @@ typedef struct dsp_core_s {
  * DSP DMA State (from dsp_dma.h)
  * ============================================================ */
 
-typedef void (*dsp_scratch_rw_func)(
-    void *opaque, uint8_t *ptr, uint32_t addr, size_t len, bool dir);
-typedef void (*dsp_fifo_rw_func)(
-    void *opaque, uint8_t *ptr, unsigned int index, size_t len, bool dir);
-
-typedef struct DSPDMAState {
-    dsp_core_t *core;
-
-    void *rw_opaque;
-    dsp_scratch_rw_func scratch_rw;
-    dsp_fifo_rw_func fifo_rw;
-
-    uint32_t configuration;
-    uint32_t control;
-    uint32_t start_block;
-    uint32_t next_block;
-
-    bool error;
-    bool eol;
-} DSPDMAState;
-
 /* ============================================================
  * DSP State (from dsp_state.h)
  * ============================================================ */
 
 typedef struct DSPState {
+    struct MCPXAPUState *apu;
     dsp_core_t core;
     DSPDMAState dma;
+    McpxDspEngine engine;
     int save_cycles;
     uint32_t interrupts;
+    uint32_t frame_starts_pending;
+    uint32_t timer_ctl, timer_period;
+    uint64_t timer_base, cycles_base;
+    bool engine_ready;
+    bool halted_since_reset;
+    bool dma_fallback_logged;
+    uint64_t trace_frame_count;
+    uint32_t trace_events_logged;
+    int16_t ep_fifo_frame_buf[256][2];
+    size_t ep_fifo_frame_bytes_used;
+    bool ep_fifo_frame_ready;
     bool is_gp;
 } DSPState;
 
@@ -373,6 +367,14 @@ typedef struct MCPXAPUVoiceFilter {
     uint16_t voice;
     float resample_buf[NUM_SAMPLES_PER_FRAME * 2];
     SRC_STATE *resampler;
+    /* Source cursor and interpolation history survive VP frame boundaries. */
+    int resample_count, resample_pos;
+    double resample_phase;
+    float resample_current[2], resample_next[2];
+    bool resample_have_current, resample_have_next, resample_source_done;
+    uint64_t resample_fetched, resample_index;
+    uint64_t resample_notify_boundary[MCPX_HW_SSLS_PER_VOICE];
+    unsigned resample_notify_pending;
     sv_filter svf[2];
     HrtfFilter hrtf;
 } MCPXAPUVoiceFilter;
@@ -467,6 +469,24 @@ struct MCPXAPUState {
 
     MemoryRegion *ram;
     uint8_t *ram_ptr;
+    size_t ram_size; /* Actual readable physical backing; not the VA aperture. */
+    bool trace_mmio; /* Immutable per-instance presence of RECOMP_APU_TRACE. */
+    bool trace_dsp_boot; /* Opt-in, initialized before the frame thread starts. */
+    bool trace_dsp_state; /* Opt-in frame-boundary DSP state samples. */
+    bool trace_output; /* Opt-in loss/clipping/timing counters, device-thread owned. */
+    /* Atomic pair of (bin + 1) bytes, left then right; zero disables it. */
+    uint32_t stereo_fallback_pair;
+    /* Fallback-only stereo-linked peak gain, owned by the APU frame thread. */
+    double fallback_limiter_gain;
+    uint64_t output_native_ticks, output_dry_ticks, output_clipped_samples;
+    uint64_t output_overloaded_samples, output_limited_samples;
+    uint64_t output_blocks, output_rebases;
+    uint64_t output_nonzero_samples, output_silent_blocks;
+    int64_t output_started_us;
+    unsigned int dsp_boot_trace_events[2]; /* Protected by the device mutex. */
+    uint64_t dsp_trace_audio_blocks, dsp_trace_ep_fifo_writes;
+    uint64_t dsp_trace_ep_fifo_bytes;
+    uint64_t dsp_trace_ep_fifo_captured;
     MemoryRegion mmio;
 
     MCPXAPUVPState vp;
@@ -480,6 +500,7 @@ struct MCPXAPUState {
     int frame_count;
     int64_t frame_count_time_ms;
     int64_t next_frame_time_us;
+    unsigned next_frame_time_fraction;
 
     struct {
         struct {
@@ -498,6 +519,7 @@ struct MCPXAPUState {
     struct {
         McpxApuDebugMonitorPoint point;
         int16_t frame_buf[256][2];
+        bool ep_fifo_frame_valid; /* Native PCM owns this epoch until consumed. */
         void *stream; /* SDL_AudioStream* - stubbed */
         int queued_bytes_low, queued_bytes_high;
     } monitor;
@@ -508,15 +530,31 @@ struct MCPXAPUState {
  * ============================================================ */
 
 /* VP functions */
+/* Publish deferred IRQ state with d->lock held, before an interrupt-dependent
+ * VP wait releases it. Does not change trap payload or voice-list cursors. */
+void mcpx_apu_publish_pending_irq(MCPXAPUState *d);
 void mcpx_apu_vp_init(MCPXAPUState *d);
 void mcpx_apu_vp_finalize(MCPXAPUState *d);
 void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
 void mcpx_apu_vp_reset(MCPXAPUState *d);
 
-/* DSP functions (stubbed) */
+/* DSP functions */
 void mcpx_apu_dsp_init(MCPXAPUState *d);
+void mcpx_apu_dsp_finalize(MCPXAPUState *d);
+void mcpx_apu_dsp_reset(MCPXAPUState *d);
 void mcpx_apu_update_dsp_preference(MCPXAPUState *d);
 void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
+
+/* Output consumes one completed eight-tick EP epoch. */
+void mcpx_apu_monitor_frame(MCPXAPUState *d);
+
+/* Aligned 32-bit GP/EP program-memory and reset-register MMIO. Unknown
+ * offsets retain the existing zero/ignored fallback. These acquire d->lock;
+ * the public MMIO dispatcher calls them without holding that lock. */
+uint64_t mcpx_apu_dsp_mmio_read(MCPXAPUState *d, hwaddr addr,
+                               unsigned int size, bool is_gp);
+void mcpx_apu_dsp_mmio_write(MCPXAPUState *d, hwaddr addr, uint64_t val,
+                            unsigned int size, bool is_gp);
 
 /* Debug globals */
 extern MCPXAPUState *g_state;

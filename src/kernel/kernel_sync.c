@@ -25,7 +25,7 @@
  *   - NULL = infinite wait
  * ============================================================================ */
 
-static DWORD xbox_nt_timeout_to_ms(PLARGE_INTEGER Timeout)
+DWORD xbox_nt_timeout_to_ms(PLARGE_INTEGER Timeout)
 {
     if (!Timeout)
         return INFINITE;

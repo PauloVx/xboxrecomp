@@ -72,6 +72,56 @@ XBOX_ANSI_STRING xbox_XeImageFileName = {
 static XBOX_LAUNCH_DATA_PAGE g_launch_data_page = {0};
 XBOX_LAUNCH_DATA_PAGE* xbox_LaunchDataPage = &g_launch_data_page;
 
+/* The Windows recomp has no per-console EEPROM identity to expose. Return a
+ * stable virtual image for full-image queries, matching the settings exposed
+ * individually below; private/factory identity bytes remain zero. */
+static ULONG xbox_eeprom_checksum(const UCHAR* bytes, size_t length)
+{
+    uint64_t sum = 0;
+    size_t i;
+
+    for (i = 0; i + sizeof(ULONG) <= length; i += sizeof(ULONG)) {
+        ULONG word;
+        memcpy(&word, bytes + i, sizeof(word));
+        sum += word;
+        if (sum > 0xFFFFFFFFu) {
+            sum = (sum & 0xFFFFFFFFu) + 1u;
+        }
+    }
+    return ~(ULONG)sum;
+}
+
+static void xbox_make_default_eeprom(UCHAR image[256])
+{
+    LONG timezone_bias = -300;
+    ULONG language = 1;
+    ULONG video = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV;
+    ULONG audio = 0;
+    ULONG parental = 0;
+    ULONG dvd_region = 1;
+    ULONG av_region = 0x00400100;
+    ULONG game_region = 1;
+
+    memset(image, 0, 256);
+    memcpy(image + 0x2C, &game_region, sizeof(game_region));
+    memcpy(image + 0x58, &av_region, sizeof(av_region));
+    memcpy(image + 0x64, &timezone_bias, sizeof(timezone_bias));
+    memcpy(image + 0x90, &language, sizeof(language));
+    memcpy(image + 0x94, &video, sizeof(video));
+    memcpy(image + 0x98, &audio, sizeof(audio));
+    memcpy(image + 0x9C, &parental, sizeof(parental));
+    memcpy(image + 0xA4, &parental, sizeof(parental));
+    memcpy(image + 0xBC, &dvd_region, sizeof(dvd_region));
+
+    /* Checksums cover the documented factory and user configuration spans. */
+    {
+        ULONG factory_checksum = xbox_eeprom_checksum(image + 0x34, 0x2C);
+        ULONG user_checksum = xbox_eeprom_checksum(image + 0x64, 0x5C);
+        memcpy(image + 0x30, &factory_checksum, sizeof(factory_checksum));
+        memcpy(image + 0x60, &user_checksum, sizeof(user_checksum));
+    }
+}
+
 /* ============================================================================
  * Section Loading
  *
@@ -134,6 +184,16 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_XBOX,
         "ExQueryNonVolatileSetting: index=0x%02X len=%u", ValueIndex, ValueLength);
 
+    if (ValueIndex == 0xFFFF) {
+        UCHAR image[256];
+        ULONG copy_length = ValueLength < sizeof(image) ? ValueLength : (ULONG)sizeof(image);
+        xbox_make_default_eeprom(image);
+        memcpy(Value, image, copy_length);
+        if (Type) *Type = 3; /* REG_BINARY */
+        if (ResultLength) *ResultLength = sizeof(image);
+        return STATUS_SUCCESS;
+    }
+
     switch (ValueIndex) {
     case XC_LANGUAGE:
         /* English = 1 */
@@ -188,6 +248,28 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         /* Misc flags: 0 = no special flags */
         if (ValueLength >= sizeof(ULONG)) {
             *(PULONG)Value = 0;
+            if (Type) *Type = 4;
+            if (ResultLength) *ResultLength = sizeof(ULONG);
+        }
+        break;
+
+    case XC_FACTORY_GAME_REGION:
+        /* North America (XC_GAME_REGION_NA). XGetGameRegion reads this; a
+         * console never reports 0, and titles that key region-specific
+         * content off it find nothing for it. */
+        if (ValueLength >= sizeof(ULONG)) {
+            *(PULONG)Value = 0x00000001;
+            if (Type) *Type = 4;
+            if (ResultLength) *ResultLength = sizeof(ULONG);
+        }
+        break;
+
+    case XC_FACTORY_AV_REGION:
+        /* NTSC-M at 60 Hz, the North American AV region
+         * (AV_STANDARD_NTSC_M | AV_FLAGS_60Hz). XGetVideoStandard takes the
+         * standard from bits 8..15, so 0 read as no standard at all. */
+        if (ValueLength >= sizeof(ULONG)) {
+            *(PULONG)Value = 0x00400100;
             if (Type) *Type = 4;
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }

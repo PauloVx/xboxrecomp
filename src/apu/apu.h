@@ -6,6 +6,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -18,8 +19,38 @@ typedef struct MCPXAPUState MCPXAPUState;
  * Returns the APU state, or NULL on failure. */
 MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr);
 
+/* Initialize with the actual readable physical backing length. DSP bootstrap
+ * bounds every SGE and source-page read against this length and the decoded
+ * APU aperture. The original initializer retains its 64MB contract. */
+MCPXAPUState *mcpx_apu_init_standalone_sized(uint8_t *ram_ptr, size_t ram_size);
+
+/* Opt in to a title's custom stereo DSP input pair for dry fallback output.
+ * Bins must be distinct and in 10..31. Returns 1 on success, or 0 for invalid
+ * arguments without changing the existing pair. New instances have no pair.
+ * Native EP PCM takes precedence; RECOMP_APU_MIXDOWN_ALL=0 also excludes this
+ * pair. The caller must keep d alive while setting its pair. */
+int mcpx_apu_set_stereo_fallback_pair(MCPXAPUState *d,
+                                      unsigned int left_bin,
+                                      unsigned int right_bin);
+
 /* Shut down and free the APU state. */
 void mcpx_apu_shutdown(MCPXAPUState *d);
+
+/* Where the APU's interrupt goes. Called with 1 while an enabled interrupt is
+ * pending (NV_PAPU_ISTS GINTSTS) and 0 once it is not -- on hardware, the PCI
+ * INTA line. The runtime connects it to the kernel's vector for the APU
+ * (xbox_SetInterruptLine(XBOX_APU_VECTOR, ...)); unset, nothing is raised. */
+void mcpx_apu_set_irq_line(void (*line)(int asserted));
+/* Complete guest ISR serialization callbacks. opaque is a live MCPXAPUState;
+ * call begin after entering ISR IRQL and end before leaving it. Recursive
+ * device MMIO is allowed. Stop/unregister delivery before device shutdown. */
+void mcpx_apu_irq_service_begin(void *opaque);
+void mcpx_apu_irq_service_end(void *opaque);
+
+/* Print the front end's state and every listed voice (for a hang report). */
+void mcpx_apu_dump_state(void);
+/* The frame thread's host thread id, 0 before it starts. */
+unsigned long mcpx_apu_frame_thread_id(void);
 
 /* MMIO read from APU register space (addr is offset from 0xFE800000). */
 uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size);

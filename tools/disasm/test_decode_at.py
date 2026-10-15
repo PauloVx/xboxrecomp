@@ -30,6 +30,7 @@ class _Section:
         self.virtual_size = len(data)
         self.executable = executable
         self.name = ".text"
+        self.data = data
 
 
 class _Image:
@@ -48,6 +49,13 @@ class _Image:
 
     def get_section_data(self, section):
         return section.data
+
+    def read_bytes_at_va(self, va, size):
+        section = self.get_section_at_va(va)
+        if section is None:
+            return None
+        offset = va - section.virtual_addr
+        return section.data[offset:offset + size]
 
 
 def _engine(va, data, executable=True):
@@ -148,6 +156,26 @@ def test_probe_follows_a_tail_jump():
     #  push esi / jmp $+2 -- a tail call is a legitimate function ending
     eng, _ = _engine(BASE, bytes.fromhex("56eb00c3"))
     assert eng.probes_as_function_body(BASE)
+
+
+def test_hotpatch_nop_needs_a_real_prologue_after_it():
+    #  mov edi,edi; push ebp; mov ebp,esp; ret
+    eng, _ = _engine(BASE, bytes.fromhex("8bff558bec c3"))
+    assert eng.probes_as_prologue(BASE)
+
+    # A hotpatch nop immediately before jump-table bytes is not a function.
+    eng, _ = _engine(BASE, bytes.fromhex("8bff 01010101010101010101"))
+    assert not eng.probes_as_prologue(BASE)
+
+
+def test_returning_body_rejects_leave_without_a_frame():
+    # WMADEC's coefficient table starts with the same pattern; the imm-ref
+    # scanner used to mistake its bytes for a callable body ending in ret.
+    eng, _ = _engine(BASE, bytes.fromhex("880fc9 bbb6c996bc c3"))
+    assert not eng.probes_as_returning_body(BASE)
+
+    eng, _ = _engine(BASE, bytes.fromhex("558bec 880f c9 c3"))
+    assert eng.probes_as_returning_body(BASE)
 
 
 def _run():

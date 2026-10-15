@@ -20,10 +20,12 @@ set(KERNEL_SOURCES
     kernel_thunks.c
     kernel_bridge.c
     xbox_memory_layout.c
+    memory_watch.c
     icall_feedback.c
     recomp_trace.c
     nv2a_pb_scan.c
     nv2a_pb_exec.c
+    thread_placement.c
 )
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})

@@ -162,6 +162,14 @@ extern uint32_t g_xbox_code_hi;
 extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
 extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
 
+/* Optional BLACK diagnostic hook for unresolved call-target stubs. */
+#ifdef RECOMP_TRACE_UNRESOLVED_STUBS
+void recomp_unresolved_stub_log(uint32_t target_va);
+#define RECOMP_UNRESOLVED_STUB_HIT(va) recomp_unresolved_stub_log(va)
+#else
+#define RECOMP_UNRESOLVED_STUB_HIT(va) ((void)0)
+#endif
+
 /* x87 stack. Per-thread for the same reason the integer registers are:
  * arguments are passed in st(0)/st(1) across call boundaries. */
 extern RECOMP_TLS double g_fp_stack[8];
@@ -253,6 +261,59 @@ extern RECOMP_TLS uint16_t g_fp_control_word;
 extern RECOMP_TLS int g_fp_cmp;
 extern RECOMP_TLS uint16_t g_fp_cc;
 #define RECOMP_FCMP_CC(c) ((uint16_t)((c)==2 ? 0x4500u : (c)<0 ? 0x0100u : (c)>0 ? 0u : 0x4000u))
+/* Round arithmetic results to the guest's 24-bit x87 significand when PC=00.
+ * The precision control applies to add/subtract/multiply/divide and sqrt,
+ * not loads or register copies. BLACK selects PC=00 and sorts normalized
+ * byte keys using both a register result and an explicitly stored float;
+ * retaining extra bits in one makes a key compare less than itself.
+ *
+ * A float cast would also narrow the exponent and depend on host rounding.
+ * Instead round the binary64 significand using the guest RC bits. This
+ * preserves the existing double stack's exponent range, signed zeros and
+ * special values. PC=10/11 keep the existing binary64 approximation (not
+ * 80-bit extended arithmetic). This helper rounds an already computed
+ * double; it does not recover precision/range lost by the host operation
+ * or emulate x87 exception flags. */
+static inline double recomp_fp_precision(double value, uint16_t control) {
+    uint64_t bits, magnitude, step, remainder, rounded;
+    unsigned drop = 29; /* binary64 has 53 significant bits; keep 24. */
+    int increment = 0;
+
+    if (control & 0x0300u) return value;
+    memcpy(&bits, &value, sizeof(bits));
+    magnitude = bits & UINT64_C(0x7FFFFFFFFFFFFFFF);
+    if (!magnitude ||
+        (magnitude & UINT64_C(0x7FF0000000000000)) ==
+                         UINT64_C(0x7FF0000000000000)) return value;
+
+    /* Binary64 subnormals are normal values in x87's wider exponent range.
+     * Count their significant bits instead of discarding 29 unconditionally. */
+    if (!(magnitude & UINT64_C(0x7FF0000000000000))) {
+        uint64_t significant = magnitude;
+        unsigned count = 0;
+        while (significant) { significant >>= 1; ++count; }
+        if (count <= 24) return value;
+        drop = count - 24;
+    }
+    step = UINT64_C(1) << drop;
+    remainder = magnitude & (step - 1);
+    if (!remainder) return value;
+    rounded = magnitude - remainder;
+    switch ((control >> 10) & 3u) {
+    case 1: increment = (bits >> 63) != 0; break; /* toward -infinity */
+    case 2: increment = (bits >> 63) == 0; break; /* toward +infinity */
+    case 3: break;                               /* toward zero */
+    default:
+        increment = remainder > (step >> 1) ||
+            (remainder == (step >> 1) && (rounded & step));
+        break;                                  /* nearest, ties to even */
+    }
+    if (increment) rounded += step;
+    bits = (bits & UINT64_C(0x8000000000000000)) | rounded;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
 /* Values in the existing double-backed stack are all representable as normal
  * x87 extended values, including binary64 subnormals. Empty stack tags and
  * unsupported extended encodings are not represented by this stack model. */
@@ -268,6 +329,10 @@ static inline uint16_t recomp_fxam(double value) {
  * followed by `test ah, 0x44; jp` is how this era's CRT asks "is this a NaN",
  * and collapsing it to "equal" answers no every time. */
 #define RECOMP_FCMP(a, b)     (((a) != (a) || (b) != (b)) ? 2 : (a) < (b) ? -1 : (a) > (b) ? 1 : 0)
+/* AH as `lahf` reads it after fcomi/fucomi set EFLAGS from a compare:
+ * bit 1 always set, CF (0x01) for less, ZF (0x40) for equal, ZF|PF|CF for
+ * unordered; SF and AF are cleared by those instructions. */
+#define RECOMP_FCMP_LAHF(c)   ((uint8_t)(0x02u | ((c)==2 ? 0x45u : (c)<0 ? 0x01u : (c)==0 ? 0x40u : 0u)))
 /* x87 integer stores use the guest RC bits, independently of host rounding.
  * Masked invalid conversions store the signed integer-indefinite value. */
 static inline int64_t recomp_fist(double value, uint16_t control, unsigned bits) {
@@ -370,10 +435,44 @@ void recomp_trace_esp(const char *name, const char *tag);
  */
 #define XBOX_PTR(addr) ((uintptr_t)(uint32_t)(addr) + g_xbox_mem_offset)
 
+/**
+ * Is the guest range [va, va + n) ordinary RAM rather than a device aperture?
+ *
+ * The block forms of `rep movs` / `rep stos` hand a whole range to the host's
+ * memcpy/memset, which move 16 or 32 bytes per instruction. The device
+ * apertures above RECOMP_DEVICE_BASE -- NV2A at 0xFD000000, the MCPX APU at
+ * 0xFE800000, flash at 0xFF000000 -- are trapped and emulated one faulting
+ * host instruction at a time, and those decoders take ordinary loads and
+ * stores, not AVX. BLACK's DirectSound copies the APU's GP DSP memory
+ * (0xFE830BF8) with `rep movsd`; the CRT memcpy faulted on `vmovdqu ymm0,
+ * [rdx]` with nothing able to decode it. Hardware accesses such a range at the
+ * element width anyway, which is what the MEM8/16/32 loops do. RAM, the
+ * contiguous window at 0x80000000 and the tiled alias at 0xF0000000 all lie
+ * below the base.
+ */
+#define RECOMP_DEVICE_BASE 0xFD000000u
+#define RECOMP_RAM_SPAN(va, n) \
+    ((uint64_t)(uint32_t)(va) + (uint64_t)(uint32_t)(n) \
+        <= (uint64_t)RECOMP_DEVICE_BASE)
+
 /** Read/write N bytes at a flat Xbox memory address. */
 #define MEM8(addr)   (*(volatile uint8_t  *)XBOX_PTR(addr))
 #define MEM16(addr)  (*(volatile uint16_t *)XBOX_PTR(addr))
 #define MEM32(addr)  (*(volatile uint32_t *)XBOX_PTR(addr))
+/* The APU's registers (0xFE800000..0xFE87FFFF): the same access as the fault handler makes, without the fault. */
+uint32_t black_apu_r32(uint32_t va);
+void black_apu_w32(uint32_t va, uint32_t value);
+void black_copy32_slow(uint32_t dst, uint32_t src, uint32_t count);
+int black_idle_yield_skip(void);
+void black_level_override(uint8_t *level, uint8_t *stage);
+#define APU_R32(va)       black_apu_r32(va)
+#define APU_W32(va, v)    black_apu_w32((va), (v))
+
+/** Stack accesses (esp- or ebp-based, never device memory): not volatile, so the compiler may keep stack
+ * values in registers and drop dead stores. Calls still act as barriers. */
+#define STK8(addr)   (*(uint8_t  *)XBOX_PTR(addr))
+#define STK16(addr)  (*(uint16_t *)XBOX_PTR(addr))
+#define STK32(addr)  (*(uint32_t *)XBOX_PTR(addr))
 
 /** Signed memory reads. */
 #define SMEM8(addr)  (*(volatile int8_t   *)XBOX_PTR(addr))
@@ -406,12 +505,14 @@ void recomp_trace_esp(const char *name, const char *tag);
 
 #ifndef RECOMP_XMM_DEFINED
 #define RECOMP_XMM_DEFINED
+#include <emmintrin.h>
 typedef union RecompXmm {
     float    f[4];
     double   d[2];
     uint32_t u[4];
     int32_t  i[4];
     uint64_t q[2];
+    __m128   m;
 } RecompXmm;
 #endif
 
@@ -420,39 +521,51 @@ extern RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
 
 /* -- construction -- */
 
+static inline RecompXmm RecompXmmOf(__m128 v) {
+    RecompXmm r; r.m = v; return r;
+}
+
 static inline RecompXmm XMM_ZERO(void) {
-    RecompXmm r; r.q[0] = 0; r.q[1] = 0; return r;
+    return RecompXmmOf(_mm_setzero_ps());
 }
 
 /** movss from memory: lane 0 set, upper lanes zeroed. */
 static inline RecompXmm XMM_SCALAR(float v) {
-    RecompXmm r = XMM_ZERO(); r.f[0] = v; return r;
+    return RecompXmmOf(_mm_set_ss(v));
 }
 
 /** movsd from memory: low double set, high double zeroed. */
 static inline RecompXmm XMM_SCALAR_DOUBLE(double v) {
-    RecompXmm r = XMM_ZERO(); r.d[0] = v; return r;
+    return RecompXmmOf(_mm_castpd_ps(_mm_set_sd(v)));
 }
 
 /** movd: 32 raw bits into lane 0, upper lanes zeroed. */
 static inline RecompXmm XMM_SCALAR_BITS(uint32_t bits) {
-    RecompXmm r = XMM_ZERO(); r.u[0] = bits; return r;
+    return RecompXmmOf(_mm_castsi128_ps(_mm_cvtsi32_si128((int)bits)));
 }
 
 /* -- guest memory --
- * Addresses are guest VAs, so they go through MEM32 like every other
- * access. Done lane-wise, which is also unaligned-safe for movups. */
+ * Addresses are guest VAs. Plain RAM is one 16-byte load or store (unaligned-safe, so movaps and movups are the
+ * same); a span that reaches the device apertures goes lane by lane through MEM32, which the fault handlers decode. */
 
 static inline RecompXmm XMM_MEM(uint32_t addr) {
     RecompXmm r;
-    r.u[0] = MEM32(addr);      r.u[1] = MEM32(addr + 4);
-    r.u[2] = MEM32(addr + 8);  r.u[3] = MEM32(addr + 12);
+    if (RECOMP_RAM_SPAN(addr, 16u)) {
+        r.m = _mm_loadu_ps((const float *)XBOX_PTR(addr));
+    } else {
+        r.u[0] = MEM32(addr);      r.u[1] = MEM32(addr + 4);
+        r.u[2] = MEM32(addr + 8);  r.u[3] = MEM32(addr + 12);
+    }
     return r;
 }
 
 static inline void XMM_STORE(uint32_t addr, RecompXmm v) {
-    MEM32(addr)      = v.u[0]; MEM32(addr + 4)  = v.u[1];
-    MEM32(addr + 8)  = v.u[2]; MEM32(addr + 12) = v.u[3];
+    if (RECOMP_RAM_SPAN(addr, 16u)) {
+        _mm_storeu_ps((float *)XBOX_PTR(addr), v.m);
+    } else {
+        MEM32(addr)      = v.u[0]; MEM32(addr + 4)  = v.u[1];
+        MEM32(addr + 8)  = v.u[2]; MEM32(addr + 12) = v.u[3];
+    }
 }
 
 /* movlps/movhps move 8 bytes into or out of one half, leaving the
@@ -476,79 +589,49 @@ static inline void recomp_xmm_store_half(uint32_t addr, RecompXmm src,
 
 /** movlhps: dst high = src low. */
 static inline RecompXmm XMM_MOVE_LOW_TO_HIGH(RecompXmm a, RecompXmm b) {
-    RecompXmm r; r.q[0] = a.q[0]; r.q[1] = b.q[0]; return r;
+    return RecompXmmOf(_mm_movelh_ps(a.m, b.m));
 }
 
 /** movhlps: dst low = src high. */
 static inline RecompXmm XMM_MOVE_HIGH_TO_LOW(RecompXmm a, RecompXmm b) {
-    RecompXmm r; r.q[0] = b.q[1]; r.q[1] = a.q[1]; return r;
+    return RecompXmmOf(_mm_movehl_ps(a.m, b.m));
 }
 
 /* -- packed arithmetic -- */
 
-#define RECOMP_XMM_LANEWISE(name, expr)                                   \
-    static inline RecompXmm name(RecompXmm a, RecompXmm b) {              \
-        RecompXmm r; int i;                                               \
-        for (i = 0; i < 4; ++i) { (void)a; (void)b; r.f[i] = (expr); }    \
-        return r;                                                         \
-    }
+static inline RecompXmm XMM_ADD(RecompXmm a, RecompXmm b) { return RecompXmmOf(_mm_add_ps(a.m, b.m)); }
+static inline RecompXmm XMM_SUB(RecompXmm a, RecompXmm b) { return RecompXmmOf(_mm_sub_ps(a.m, b.m)); }
+static inline RecompXmm XMM_MUL(RecompXmm a, RecompXmm b) { return RecompXmmOf(_mm_mul_ps(a.m, b.m)); }
+static inline RecompXmm XMM_DIV(RecompXmm a, RecompXmm b) { return RecompXmmOf(_mm_div_ps(a.m, b.m)); }
+/* MINPS/MAXPS return the second operand when the lanes are unordered or equal. */
+static inline RecompXmm XMM_MIN(RecompXmm a, RecompXmm b) { return RecompXmmOf(_mm_min_ps(a.m, b.m)); }
+static inline RecompXmm XMM_MAX(RecompXmm a, RecompXmm b) { return RecompXmmOf(_mm_max_ps(a.m, b.m)); }
 
-RECOMP_XMM_LANEWISE(XMM_ADD, a.f[i] + b.f[i])
-RECOMP_XMM_LANEWISE(XMM_SUB, a.f[i] - b.f[i])
-RECOMP_XMM_LANEWISE(XMM_MUL, a.f[i] * b.f[i])
-RECOMP_XMM_LANEWISE(XMM_DIV, a.f[i] / b.f[i])
-/* MINPS/MAXPS return the second operand when the lanes are unordered or
- * equal -- that is the hardware's tie-break, not a C fmin/fmax. */
-RECOMP_XMM_LANEWISE(XMM_MIN, (a.f[i] < b.f[i]) ? a.f[i] : b.f[i])
-RECOMP_XMM_LANEWISE(XMM_MAX, (a.f[i] > b.f[i]) ? a.f[i] : b.f[i])
-
-#define RECOMP_XMM_BITWISE(name, expr)                                    \
-    static inline RecompXmm name(RecompXmm a, RecompXmm b) {              \
-        RecompXmm r; int i;                                               \
-        for (i = 0; i < 4; ++i) { (void)a; (void)b; r.u[i] = (expr); }    \
-        return r;                                                         \
-    }
-
-RECOMP_XMM_BITWISE(XMM_AND,  a.u[i] & b.u[i])
-RECOMP_XMM_BITWISE(XMM_OR,   a.u[i] | b.u[i])
-RECOMP_XMM_BITWISE(XMM_XOR,  a.u[i] ^ b.u[i])
+static inline RecompXmm XMM_AND(RecompXmm a, RecompXmm b) { return RecompXmmOf(_mm_and_ps(a.m, b.m)); }
+static inline RecompXmm XMM_OR(RecompXmm a, RecompXmm b) { return RecompXmmOf(_mm_or_ps(a.m, b.m)); }
+static inline RecompXmm XMM_XOR(RecompXmm a, RecompXmm b) { return RecompXmmOf(_mm_xor_ps(a.m, b.m)); }
 /* ANDNPS is ~dst & src, not dst & ~src. */
-RECOMP_XMM_BITWISE(XMM_ANDN, (~a.u[i]) & b.u[i])
+static inline RecompXmm XMM_ANDN(RecompXmm a, RecompXmm b) { return RecompXmmOf(_mm_andnot_ps(a.m, b.m)); }
 
 /* Compares produce an all-ones or all-zero mask per lane. EQ/LT/LE are
  * the ordered forms (false when either lane is NaN); NEQ is the
  * unordered form, so it is true when a lane is NaN. */
-RECOMP_XMM_BITWISE(XMM_CMP_EQ,  (a.f[i] == b.f[i]) ? 0xFFFFFFFFu : 0u)
-RECOMP_XMM_BITWISE(XMM_CMP_LT,  (a.f[i] <  b.f[i]) ? 0xFFFFFFFFu : 0u)
-RECOMP_XMM_BITWISE(XMM_CMP_LE,  (a.f[i] <= b.f[i]) ? 0xFFFFFFFFu : 0u)
-RECOMP_XMM_BITWISE(XMM_CMP_NEQ, (a.f[i] == b.f[i]) ? 0u : 0xFFFFFFFFu)
+static inline RecompXmm XMM_CMP_EQ(RecompXmm a, RecompXmm b) { return RecompXmmOf(_mm_cmpeq_ps(a.m, b.m)); }
+static inline RecompXmm XMM_CMP_LT(RecompXmm a, RecompXmm b) { return RecompXmmOf(_mm_cmplt_ps(a.m, b.m)); }
+static inline RecompXmm XMM_CMP_LE(RecompXmm a, RecompXmm b) { return RecompXmmOf(_mm_cmple_ps(a.m, b.m)); }
+static inline RecompXmm XMM_CMP_NEQ(RecompXmm a, RecompXmm b) { return RecompXmmOf(_mm_cmpneq_ps(a.m, b.m)); }
 
 /** movmskps: the four lane sign bits, packed into the low nibble. */
 static inline uint32_t XMM_MOVEMASK(RecompXmm a) {
-    return ((a.u[0] >> 31) & 1u) | (((a.u[1] >> 31) & 1u) << 1)
-         | (((a.u[2] >> 31) & 1u) << 2) | (((a.u[3] >> 31) & 1u) << 3);
+    return (uint32_t)_mm_movemask_ps(a.m);
 }
 
-/** shufps: lanes 0-1 selected out of `a`, lanes 2-3 out of `b`. */
-static inline RecompXmm XMM_SHUFFLE(RecompXmm a, RecompXmm b, uint32_t imm) {
-    RecompXmm r;
-    r.u[0] = a.u[(imm >> 0) & 3u]; r.u[1] = a.u[(imm >> 2) & 3u];
-    r.u[2] = b.u[(imm >> 4) & 3u]; r.u[3] = b.u[(imm >> 6) & 3u];
-    return r;
-}
+/** shufps: lanes 0-1 selected out of `a`, lanes 2-3 out of `b`. The selector is always a constant. */
+#define XMM_SHUFFLE(a, b, imm) RecompXmmOf(_mm_shuffle_ps((a).m, (b).m, (imm) & 0xFF))
 
 /** unpcklps / unpckhps: interleave the low or high halves. */
-static inline RecompXmm XMM_UNPACK_LOW(RecompXmm a, RecompXmm b) {
-    RecompXmm r;
-    r.u[0] = a.u[0]; r.u[1] = b.u[0]; r.u[2] = a.u[1]; r.u[3] = b.u[1];
-    return r;
-}
-
-static inline RecompXmm XMM_UNPACK_HIGH(RecompXmm a, RecompXmm b) {
-    RecompXmm r;
-    r.u[0] = a.u[2]; r.u[1] = b.u[2]; r.u[2] = a.u[3]; r.u[3] = b.u[3];
-    return r;
-}
+static inline RecompXmm XMM_UNPACK_LOW(RecompXmm a, RecompXmm b) { return RecompXmmOf(_mm_unpacklo_ps(a.m, b.m)); }
+static inline RecompXmm XMM_UNPACK_HIGH(RecompXmm a, RecompXmm b) { return RecompXmmOf(_mm_unpackhi_ps(a.m, b.m)); }
 
 /* ================================================================
  * Flag computation helpers
@@ -696,7 +779,7 @@ static inline uint16_t ROR16(uint16_t val, int n) {
 #define PUSH32(sp, val) do { \
     uint32_t _pv = (uint32_t)(val); \
     (sp) -= 4; \
-    MEM32(sp) = _pv; \
+    STK32(sp) = _pv; \
 } while(0)
 
 /**
@@ -714,7 +797,7 @@ static inline int recomp_parity8(uint32_t x) {
 
 /** Pop a 32-bit value from the simulated stack. */
 #define POP32(sp, dst) do { \
-    (dst) = MEM32(sp); \
+    (dst) = STK32(sp); \
     (sp) += 4; \
 } while(0)
 

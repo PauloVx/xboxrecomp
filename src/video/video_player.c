@@ -45,12 +45,14 @@ static struct {
     IMFSourceReader     *reader;        /* source reader */
     int                  width;
     int                  height;
+    uint32_t             aspect_width, aspect_height;
     float                duration;      /* seconds */
     float                elapsed;       /* playback position */
     float                frame_time;    /* time per frame (1/fps) */
     float                next_frame_at; /* when to decode next frame */
     int                  finished;
     int                  has_frame;     /* current frame valid? */
+    uint64_t             sequence;      /* advances only for decoded frames */
     enum vp_format       format;        /* decoded frame format */
 
     /* Frame buffer (BGRA, uploaded to D3D texture) */
@@ -87,6 +89,23 @@ static uint32_t next_pot(uint32_t v)
     v |= v >> 1; v |= v >> 2; v |= v >> 4;
     v |= v >> 8; v |= v >> 16;
     return v + 1;
+}
+
+static void video_set_display_aspect(uint32_t width, uint32_t height,
+                                     uint64_t pixel_aspect)
+{
+    uint32_t num = (uint32_t)(pixel_aspect >> 32), den = (uint32_t)pixel_aspect;
+    uint64_t w, h, a, b;
+    if (!num || !den) num = den = 1;
+    w = (uint64_t)width * num; h = (uint64_t)height * den;
+    a = w; b = h;
+    while (b) { uint64_t rem = a % b; a = b; b = rem; }
+    if (a) { w /= a; h /= a; }
+    if (!w || !h || w > UINT32_MAX || h > UINT32_MAX) {
+        w = width; h = height;
+    }
+    g_vp.aspect_width = (uint32_t)w;
+    g_vp.aspect_height = (uint32_t)h;
 }
 
 
@@ -130,7 +149,7 @@ void video_shutdown(void)
     }
 }
 
-int video_open(const char *path)
+static int video_open_mode(const char *path, int pixels_only)
 {
     HRESULT hr;
     IMFAttributes *attrs = NULL;
@@ -181,6 +200,18 @@ int video_open(const char *path)
         IMFMediaType_GetUINT64(native_type, &MF_MT_FRAME_SIZE, &frame_size);
         g_vp.width  = (int)(frame_size >> 32);
         g_vp.height = (int)(frame_size & 0xFFFFFFFF);
+    }
+    /* Movie display aspect comes from its own pixel-aspect metadata, never
+     * BLACK's gameplay camera selection. Missing metadata means square pixels. */
+    {
+        UINT64 pixel_aspect = 0;
+        IMFMediaType_GetUINT64(native_type, &MF_MT_PIXEL_ASPECT_RATIO, &pixel_aspect);
+        video_set_display_aspect((uint32_t)g_vp.width, (uint32_t)g_vp.height, pixel_aspect);
+    }
+    if (pixels_only && (g_vp.width <= 0 || g_vp.height <= 0 ||
+        g_vp.width > 8192 || g_vp.height > 8192)) {
+        fprintf(stderr, "  [VIDEO] unsupported host frame dimensions %dx%d\n", g_vp.width, g_vp.height);
+        goto fail;
     }
 
     /* Extract frame rate */
@@ -309,12 +340,14 @@ int video_open(const char *path)
      * here, so asking for A8R8G8B8 made the d3d8 layer faithfully unswizzle
      * data that was never swizzled, which scrambled every frame into a grid of
      * blocks. */
-    hr = d3d8_CreateTextureImpl(g_vp.tex_width, g_vp.tex_height, 1, 0,
-                                D3DFMT_LIN_A8R8G8B8, &g_vp.texture);
-    if (FAILED(hr)) {
-        fprintf(stderr, "  [VIDEO] Failed to create texture %ux%u (hr=0x%08lX)\n",
-                g_vp.tex_width, g_vp.tex_height, hr);
-        goto fail;
+    if (!pixels_only) {
+        hr = d3d8_CreateTextureImpl(g_vp.tex_width, g_vp.tex_height, 1, 0,
+                                    D3DFMT_LIN_A8R8G8B8, &g_vp.texture);
+        if (FAILED(hr)) {
+            fprintf(stderr, "  [VIDEO] Failed to create texture %ux%u (hr=0x%08lX)\n",
+                    g_vp.tex_width, g_vp.tex_height, hr);
+            goto fail;
+        }
     }
 
     g_vp.elapsed = 0.0f;
@@ -335,6 +368,24 @@ fail:
     if (attrs) IMFAttributes_Release(attrs);
     video_close();
     return -1;
+}
+
+int video_open(const char *path) { return video_open_mode(path, 0); }
+int video_open_pixels(const char *path) { return video_open_mode(path, 1); }
+
+int video_get_frame_pixels(VideoFramePixels *frame)
+{
+    if (!frame || !g_vp.has_frame || !g_vp.frame_buf ||
+        g_vp.width <= 0 || g_vp.height <= 0) return 0;
+    frame->pixels = g_vp.frame_buf;
+    frame->bytes = g_vp.frame_buf_size;
+    frame->width = (uint32_t)g_vp.width;
+    frame->height = (uint32_t)g_vp.height;
+    frame->pitch = g_vp.stride;
+    frame->aspect_width = g_vp.aspect_width;
+    frame->aspect_height = g_vp.aspect_height;
+    frame->sequence = g_vp.sequence;
+    return 1;
 }
 
 /* Clamp helper for YUV conversion */
@@ -542,6 +593,7 @@ int video_update(float dt)
             g_vp.finished = 1;
             return -1;
         }
+        if (r > 0) ++g_vp.sequence;
         g_vp.next_frame_at += g_vp.frame_time;
     }
 
@@ -614,10 +666,12 @@ void video_close(void)
         g_vp.frame_buf = NULL;
     }
     g_vp.has_frame = 0;
+    g_vp.sequence = 0;
     g_vp.finished = 0;
     g_vp.elapsed = 0.0f;
     g_vp.width = 0;
     g_vp.height = 0;
+    g_vp.aspect_width = g_vp.aspect_height = 0;
 }
 
 /* Write the frame currently decoded to a 24-bit BMP.
@@ -673,6 +727,8 @@ int video_dump_frame_bmp(const char *path)
 int  video_init(void)            { return -1; }
 void video_shutdown(void)        {}
 int  video_open(const char *p)   { (void)p; return -1; }
+int  video_open_pixels(const char *p) { (void)p; return -1; }
+int  video_get_frame_pixels(VideoFramePixels *p) { (void)p; return 0; }
 int  video_update(float dt)      { (void)dt; return -1; }
 void video_render(void)          {}
 int  video_is_finished(void)     { return 1; }

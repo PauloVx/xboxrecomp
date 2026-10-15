@@ -11,9 +11,30 @@ add_library(xbox_nv2a STATIC
     nv2a_pb_replay.c
     nv2a_mmio_hook.c
     nv2a_pb_test.c
+    # Kelvin: the NV2A 3D engine on the CPU (RECOMP_NV2A_KELVIN=1).
+    kelvin/kelvin.c
+    kelvin/kelvin_mmio.c
+    kelvin/kelvin_pgraph.c
+    kelvin/kelvin_render.c
+    kelvin/kelvin_gpu.c
+    kelvin/kelvin_vsh.c
+    kelvin/kelvin_pixel.c
+    kelvin/kelvin_texture.c
+    kelvin/kelvin_workers.c
+    kelvin/nv2a_vsh_cpu/nv2a_vsh_cpu.c
+    kelvin/nv2a_vsh_cpu/nv2a_vsh_disassembler.c
+    kelvin/nv2a_vsh_cpu/nv2a_vsh_emulator.c
+    kelvin/nv2a_vsh_cpu/nv2a_vsh_emulator4.c
+    kelvin/nv2a_vsh_cpu/nv2a_vsh_emulator8.c
+    kelvin/nv2a_vsh_cpu/nv2a_vsh_emulator_execution_state.c
 )
 
+# The production renderer takes its raster size from the video settings (src/video/pc_video.c); the unit tests that
+# include kelvin_render.c directly keep the environment-only behaviour.
+set_source_files_properties(kelvin/kelvin_render.c PROPERTIES COMPILE_DEFINITIONS KRES_PC_VIDEO=1)
+
 target_include_directories(xbox_nv2a PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(xbox_nv2a PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
 if(MSVC)
     target_compile_options(xbox_nv2a PRIVATE
@@ -21,6 +42,11 @@ if(MSVC)
         /wd4244
         /wd4146
         /wd4267
+        # The CPU renderer's hot loops: AVX2 code generation (no FMA
+        # contraction under /fp:precise, so results are unchanged) and no
+        # stack-cookie checks in its per-pixel functions.
+        /arch:AVX2
+        /GS-
     )
     target_compile_definitions(xbox_nv2a PRIVATE
         _CRT_SECURE_NO_WARNINGS
@@ -32,4 +58,5 @@ endif()
 target_link_libraries(xbox_nv2a PRIVATE platform)
 if(WIN32)
     target_link_libraries(xbox_nv2a PRIVATE kernel32)
+    target_link_libraries(xbox_nv2a PRIVATE windowscodecs ole32)  # photo captures as PNG (WIC)
 endif()

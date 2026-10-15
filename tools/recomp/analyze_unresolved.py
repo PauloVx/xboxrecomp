@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, bisect, os
+import argparse, json, bisect, os
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, '..', '..'))
@@ -8,36 +8,44 @@ UNRESOLVED_PATH = os.path.join(SCRIPT_DIR, 'output', 'unresolved_symbols.txt')
 FUNCTIONS_PATH = os.path.join(REPO_ROOT, 'tools', 'disasm', 'output', 'functions.json')
 OUTPUT_PATH = os.path.join(SCRIPT_DIR, 'output', 'missing_functions.json')
 
-SECTIONS = [
-    {'name': '.text', 'va': 0x00011000, 'size': 2863616},
-    {'name': 'XMV', 'va': 0x002CC200, 'size': 163124},
-    {'name': 'DSOUND', 'va': 0x002F3F40, 'size': 52668},
-    {'name': 'WMADEC', 'va': 0x00300D00, 'size': 105828},
-    {'name': 'XONLINE', 'va': 0x0031AA80, 'size': 124764},
-    {'name': 'XNET', 'va': 0x003391E0, 'size': 78056},
-    {'name': 'D3D', 'va': 0x0034C2E0, 'size': 83828},
-    {'name': 'XGRPH', 'va': 0x00360A60, 'size': 8300},
-    {'name': 'XPP', 'va': 0x00362AE0, 'size': 36052},
-    {'name': '.rdata', 'va': 0x0036B7C0, 'size': 289684},
-    {'name': '.data', 'va': 0x003B2360, 'size': 3904988},
-    {'name': 'DOLBY', 'va': 0x0076B940, 'size': 29056},
-    {'name': 'XON_RD', 'va': 0x00772AC0, 'size': 5416},
-    {'name': '.data1', 'va': 0x00774000, 'size': 224},
-]
+def section_start(section):
+    value = section.get('virtual_addr', section.get('va'))
+    return int(value, 16) if isinstance(value, str) else value
 
-TEXT_START = 0x00011000
-TEXT_END = 0x00011000 + 2863616
 
-def find_section(addr):
-    for s in SECTIONS:
-        if s['va'] <= addr < s['va'] + s['size']:
+def section_size(section):
+    return section.get('virtual_size', section.get('size'))
+
+
+def find_section(addr, sections):
+    for s in sections:
+        start = section_start(s)
+        if start <= addr < start + section_size(s):
             return s['name']
     return None
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(description='Classify unresolved addresses using parsed XBE sections.')
+    parser.add_argument('--xbe-analysis', required=True,
+                        help='JSON metadata produced by tools.xbe_parser for the XBE used in this build')
+    parser.add_argument('--unresolved', default=UNRESOLVED_PATH,
+                        help='text file containing unresolved sub_XXXXXXXX addresses')
+    parser.add_argument('--functions', default=FUNCTIONS_PATH,
+                        help='function database JSON')
+    parser.add_argument('--output-dir', default=os.path.dirname(OUTPUT_PATH),
+                        help='directory for missing_functions.json and addable_functions.json')
+    args = parser.parse_args(argv)
+    with open(args.xbe_analysis, encoding='utf-8') as f:
+        sections = json.load(f)['sections']
+    text_sections = [s for s in sections if s['name'] == '.text']
+    if len(text_sections) != 1:
+        parser.error('XBE metadata must contain exactly one .text section')
+    text_start = section_start(text_sections[0])
+    text_end = text_start + section_size(text_sections[0])
+
     print('Loading function database...')
-    with open(FUNCTIONS_PATH) as f:
+    with open(args.functions, encoding='utf-8') as f:
         raw_funcs = json.load(f)
 
     functions = []
@@ -53,7 +61,7 @@ def main():
     print(f'  Range: 0x{functions[0][0]:08X} - 0x{functions[-1][1]:08X}')
 
     print('Loading unresolved symbols...')
-    with open(UNRESOLVED_PATH) as f:
+    with open(args.unresolved, encoding='utf-8') as f:
         unresolved = []
         for line in f:
             line = line.strip()
@@ -75,7 +83,7 @@ def main():
     missing_functions = []
 
     for addr in unresolved:
-        section = find_section(addr)
+        section = find_section(addr, sections)
 
         if section is None:
             results['unknown'].append(addr)
@@ -88,8 +96,8 @@ def main():
             continue
 
         if section != '.text':
-            sec_info = next(s for s in SECTIONS if s['name'] == section)
-            sec_end = sec_info['va'] + sec_info['size']
+            sec_info = next(s for s in sections if s['name'] == section)
+            sec_end = section_start(sec_info) + section_size(sec_info)
             results['library_section'].append((addr, section))
             missing_functions.append({'address': f'0x{addr:08X}', 'type': 'library_section', 'section': section, 'estimated_end': f'0x{sec_end:08X}'})
             continue
@@ -97,8 +105,8 @@ def main():
         idx = bisect.bisect_right(func_starts, addr) - 1
 
         if idx < 0:
-            next_start = func_starts[0] if func_starts else TEXT_END
-            results['gap'].append((addr, TEXT_START, next_start, next_start - addr))
+            next_start = func_starts[0] if func_starts else text_end
+            results['gap'].append((addr, text_start, next_start, next_start - addr))
             missing_functions.append({'address': f'0x{addr:08X}', 'type': 'gap', 'next_func_start': f'0x{next_start:08X}', 'estimated_end': f'0x{next_start:08X}', 'gap_size': next_start - addr})
             continue
 
@@ -111,7 +119,7 @@ def main():
 
         if addr == func_end:
             next_idx = idx + 1
-            next_start = functions[next_idx][0] if next_idx < len(functions) else TEXT_END
+            next_start = functions[next_idx][0] if next_idx < len(functions) else text_end
             gap_to_next = next_start - addr
             results['continuation'].append((addr, func_start, func_name, gap_to_next))
             missing_functions.append({'address': f'0x{addr:08X}', 'type': 'continuation', 'parent_func': f'0x{func_start:08X}', 'parent_name': func_name, 'estimated_end': f'0x{next_start:08X}', 'gap_size': gap_to_next})
@@ -122,7 +130,7 @@ def main():
             continue
 
         next_idx = idx + 1
-        next_start = functions[next_idx][0] if next_idx < len(functions) else TEXT_END
+        next_start = functions[next_idx][0] if next_idx < len(functions) else text_end
 
         if func_end <= addr < next_start:
             gap_size = next_start - addr
@@ -193,9 +201,9 @@ def main():
             section_counts[sec] = section_counts.get(sec, 0) + 1
         print('    By section:')
         for sec, count in sorted(section_counts.items(), key=lambda x: -x[1]):
-            sec_info = next(s for s in SECTIONS if s['name'] == sec)
-            va = sec_info['va']
-            sz = sec_info['size']
+            sec_info = next(s for s in sections if s['name'] == sec)
+            va = section_start(sec_info)
+            sz = section_size(sec_info)
             print(f'      {sec:12s}: {count:4d} functions (section: 0x{va:08X}, {sz:,} bytes)')
         print('    Examples:')
         for a, sec in lib[:10]:
@@ -208,7 +216,7 @@ def main():
     if data:
         print('    Examples:')
         for a in data[:10]:
-            sec = find_section(a)
+            sec = find_section(a, sections)
             print(f'      0x{a:08X}  ({sec})')
     print()
 
@@ -249,16 +257,18 @@ def main():
 
     if lib:
         lib_sections_used = set(sec for _, sec in lib)
-        total_lib_bytes = sum(next(s for s in SECTIONS if s['name'] == sec)['size'] for sec in lib_sections_used)
+        total_lib_bytes = sum(section_size(next(s for s in sections if s['name'] == sec)) for sec in lib_sections_used)
         print(f'  Total library section bytes (all used sections): {total_lib_bytes:,} ({total_lib_bytes/1024:.1f} KB)')
     print()
 
-    print(f'\nWriting {len(missing_functions)} entries to {OUTPUT_PATH}...')
-    with open(OUTPUT_PATH, 'w') as f:
+    os.makedirs(args.output_dir, exist_ok=True)
+    output_path = os.path.join(args.output_dir, 'missing_functions.json')
+    print(f'\nWriting {len(missing_functions)} entries to {output_path}...')
+    with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(missing_functions, f, indent=2)
     print('Done.')
 
-    quick_add_path = os.path.join(SCRIPT_DIR, 'output', 'addable_functions.json')
+    quick_add_path = os.path.join(args.output_dir, 'addable_functions.json')
     addable = []
     for entry in missing_functions:
         if entry['type'] in ('gap', 'continuation', 'library_section'):
@@ -270,7 +280,7 @@ def main():
                 'section': entry.get('section', '.text'),
             })
     print(f'Writing {len(addable)} addable function candidates to {quick_add_path}...')
-    with open(quick_add_path, 'w') as f:
+    with open(quick_add_path, 'w', encoding='utf-8') as f:
         json.dump(addable, f, indent=2)
     print('Done.')
 

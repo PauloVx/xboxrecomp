@@ -269,7 +269,7 @@ def cmd_seeds(args):
     # with nothing logged anywhere. That is how the Xbox Dashboard lost
     # __heap_init. Decoding cleanly does not save it -- an interior address is
     # by definition mid-function, so it decodes fine.
-    probe = _decode_probe(args.xbe)
+    probe = _decode_probe(args.xbe, args.analysis_json)
     bodies = load_function_bodies(args.functions)
     kept, dropped = {}, []
     for va, flags in sorted(db.items()):
@@ -297,7 +297,7 @@ def cmd_seeds(args):
     return 0
 
 
-def _decode_probe(xbe_path):
+def _decode_probe(xbe_path, analysis_json=None):
     """Return a callable(va) -> bool backed by the disassembler's own probe.
 
     None when no XBE was given, which leaves cmd_seeds on the alignment filter.
@@ -306,7 +306,7 @@ def _decode_probe(xbe_path):
         return None
     from tools.disasm.loader import load_image, DATA_SECTION_NAMES
     from tools.disasm.engine import DisasmEngine
-    image = load_image(xbe_path)
+    image = load_image(xbe_path, analysis_json=analysis_json)
     engine = DisasmEngine(image)
     for section in image.sections:
         if section.executable and section.name not in DATA_SECTION_NAMES:
@@ -362,6 +362,9 @@ def main(argv=None):
     s.add_argument("--xbe", default=None, metavar="XBE",
                    help="decode each target and keep only those that read as a "
                         "function body. Supersedes --align; strongly preferred.")
+    s.add_argument("--analysis-json", default=None, metavar="JSON",
+                   help="XBE analysis file to use with --xbe when it is not "
+                        "beside the executable under the expected name")
     s.add_argument("--align", type=int, default=16, metavar="N",
                    help="drop targets not N-byte aligned; 0 disables. Default "
                         "%(default)s, which is what MSVC emits for a function "

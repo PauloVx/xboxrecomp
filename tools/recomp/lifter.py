@@ -1215,6 +1215,11 @@ class Lifter:
         self.abi_db = abi_db or {}
         self.xbe_data = xbe_data
         self.manual_functions = set(manual_functions or ())
+        # {addr: name} for functions the project wraps: it defines sub_X by
+        # hand and calls the generated body as sub_X_gen. The wrapper is the
+        # function at that address, so every direct call goes to it; only the
+        # hand-written code reaches the _gen body. Set by the batch translator.
+        self.wrapped_functions = {}
         self._fp_top = 0  # FPU stack top index
         self.func_start = 0  # Set per-function by translator
         self.func_end = 0
@@ -1269,7 +1274,9 @@ class Lifter:
         function any naming pass had touched. Labels still cover call targets
         that are not known function starts.
         """
-        if addr in self.func_db:
+        if addr in self.wrapped_functions:
+            name = self.wrapped_functions[addr]
+        elif addr in self.func_db:
             name = self.func_db[addr].get("name", f"sub_{addr:08X}")
         elif addr in self.label_db:
             name = self.label_db[addr]
@@ -2343,6 +2350,10 @@ class Lifter:
         if not op.mem_disp or not (op.mem_index or op.mem_base):
             return []
         table_va = op.mem_disp
+        # The translator pre-fills this for tables a forward read from the
+        # displacement gets wrong: split-CFG recovery, and dispatches whose
+        # proven index range goes negative or skips the displacement slot
+        # (tools/disasm/jump_tables.py).
         targets = self.jump_table_targets.get(table_va)
         if targets is None:
             targets = self._read_jump_table(table_va)
@@ -2520,11 +2531,21 @@ class Lifter:
         #
         # memcpy is still used when the ranges provably do not overlap, which
         # is the overwhelming majority of calls.
+        #
+        # ...and when both lie in RAM. A device aperture (RECOMP_RAM_SPAN in
+        # recomp_types.h) is only reachable through the MMIO trap, which
+        # decodes one plain load or store at a time; memcpy's vector moves
+        # fault there. BLACK's DirectSound reads the APU's GP DSP memory with
+        # `rep movsd`. The element loops use the volatile MEM accessors, one
+        # access of the instruction's own width each, as the hardware does.
+        block_ok = ("RECOMP_RAM_SPAN(edi, _n) && RECOMP_RAM_SPAN(esi, _n)"
+                    " && (_d + _n <= _s || _s + _n <= _d)")
         if "movsb" in m:
             return ["if (!g_df) { uint8_t *_d = (uint8_t*)XBOX_PTR(edi),"
                     " *_s = (uint8_t*)XBOX_PTR(esi); uint32_t _n = ecx;",
-                    "  if (_d + _n <= _s || _s + _n <= _d) memcpy(_d, _s, _n);",
-                    "  else { uint32_t _i; for (_i = 0; _i < _n; _i++) _d[_i] = _s[_i]; }",
+                    f"  if ({block_ok}) memcpy(_d, _s, _n);",
+                    "  else { uint32_t _i; for (_i = 0; _i < _n; _i++)"
+                    " MEM8(edi + _i) = MEM8(esi + _i); }",
                     "  esi += ecx; edi += ecx; }",
                     "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
                     " MEM8(edi - _i) = MEM8(esi - _i); esi -= ecx; edi -= ecx; }",
@@ -2532,7 +2553,7 @@ class Lifter:
         if "movsd" in m:
             return ["if (!g_df) { uint8_t *_d = (uint8_t*)XBOX_PTR(edi),"
                     " *_s = (uint8_t*)XBOX_PTR(esi); uint32_t _n = ecx * 4;",
-                    "  if (_d + _n <= _s || _s + _n <= _d) memcpy(_d, _s, _n);",
+                    f"  if ({block_ok}) memcpy(_d, _s, _n);",
                     "  else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
                     " MEM32(edi + _i*4) = MEM32(esi + _i*4); }",
                     "  esi += ecx * 4; edi += ecx * 4; }",
@@ -2542,7 +2563,7 @@ class Lifter:
         if "movsw" in m:
             return ["if (!g_df) { uint8_t *_d = (uint8_t*)XBOX_PTR(edi),"
                     " *_s = (uint8_t*)XBOX_PTR(esi); uint32_t _n = ecx * 2;",
-                    "  if (_d + _n <= _s || _s + _n <= _d) memcpy(_d, _s, _n);",
+                    f"  if ({block_ok}) memcpy(_d, _s, _n);",
                     "  else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
                     " MEM16(edi + _i*2) = MEM16(esi + _i*2); }",
                     "  esi += ecx * 2; edi += ecx * 2; }",
@@ -2550,7 +2571,11 @@ class Lifter:
                     " MEM16(edi - _i*2) = MEM16(esi - _i*2); esi -= ecx * 2; edi -= ecx * 2; }",
                     "ecx = 0; /* rep movsw */"]
         if "stosb" in m:
-            return ["if (!g_df) { memset((void*)XBOX_PTR(edi), (uint8_t)eax, ecx); edi += ecx; }",
+            return ["if (!g_df) { if (RECOMP_RAM_SPAN(edi, ecx))"
+                    " memset((void*)XBOX_PTR(edi), (uint8_t)eax, ecx);",
+                    "  else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
+                    " MEM8(edi + _i) = LO8(eax); }",
+                    "  edi += ecx; }",
                     "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
                     " MEM8(edi - _i) = LO8(eax); edi -= ecx; }",
                     "ecx = 0; /* rep stosb */"]
@@ -3180,6 +3205,14 @@ class Lifter:
         # FPU is complex. We translate common patterns to double operations.
         # Full accuracy would require an x87 stack emulator.
 
+        # x87 TOP rotations change only the circular index, never values.
+        # FFREE is tag-only; this untagged model retains its existing no-op.
+        # FPTAN; FFREE ST(0); FINCSTP discards the implicit 1.0 before FSTP.
+        if m == "fincstp":
+            return ["fp_pop(); /* fincstp */"]
+        if m == "fdecstp":
+            return ["g_fp_top = (g_fp_top + 7u) & 7u; /* fdecstp */"]
+
         if m == "fld":
             if len(ops) >= 1:
                 if ops[0].type == "mem":
@@ -3274,8 +3307,14 @@ class Lifter:
 
             def _combine(dst, src):
                 if cop in ("+", "*") or not reverse:
-                    return f"{dst} = {dst} {cop} {src};"
-                return f"{dst} = {src} {cop} {dst};"   # reversed sub/div
+                    expr = f"{dst} {cop} {src}"
+                else:
+                    expr = f"{src} {cop} {dst}"   # reversed sub/div
+                # PC applies to arithmetic results, not loads or register
+                # copies. Keeping a 24-bit guest result in binary64 can make
+                # it compare unequal to its own later single-precision store.
+                return (f"{dst} = recomp_fp_precision({expr}, "
+                        "g_fp_control_word);")
 
             # Memory operand: dst is st0, no pop (memory forms never pop).
             if ops and ops[0].type == "mem":
@@ -3322,7 +3361,8 @@ class Lifter:
         if m == "fabs":
             return [f"fp_top() = fabs(fp_top()); /* fabs */"]
         if m == "fsqrt":
-            return [f"fp_top() = sqrt(fp_top()); /* fsqrt */"]
+            return ["fp_top() = recomp_fp_precision(sqrt(fp_top()), "
+                    "g_fp_control_word); /* fsqrt */"]
         # x87 transcendentals. None of these were implemented, so every one fell
         # through to the unknown-op path and left the FP stack untouched --
         # silently, because an unimplemented FPU op looks exactly like an
@@ -3532,6 +3572,29 @@ def lift_basic_block(lifter, bb, flag_state=None):
             last_flag_setter = flag_insn.mnemonic
             last_flag_ops = list(flag_insn.operands)
             i += consumed
+            continue
+
+        # `lahf` after an x87 compare-to-EFLAGS is the SSE-era float branch
+        # idiom: `fucompi st(1); fstp st(0); lahf; test ah, 0x44; jnp`.
+        # The compare's CF/ZF/PF have to land in AH, or the test reads
+        # whatever eax held. Lifted alone, lahf was a comment, and BLACK's
+        # movie clock (0x000C4626) then took the wrong side of an "is the
+        # last frame time zero" test and stopped advancing after three
+        # frames. Other flag setters keep the old behaviour below.
+        if curr.mnemonic == "lahf" and last_flag_setter in (
+                "fcompi", "fcomip", "fucomi", "fucompi", "fucomip", "fcomi"):
+            stmts.append("SET_HI8(eax, RECOMP_FCMP_LAHF(g_fp_cmp));"
+                         f" /* lahf <- {last_flag_setter} flags */")
+            i += 1
+            continue
+        # The SSE form of the same idiom: (u)comiss/(u)comisd set CF/ZF/PF
+        # exactly as fucomi does, from the operands the lifter keeps in
+        # _fca/_fcb.
+        if curr.mnemonic == "lahf" and last_flag_setter in (
+                "ucomiss", "comiss", "ucomisd", "comisd"):
+            stmts.append("SET_HI8(eax, RECOMP_FCMP_LAHF(RECOMP_FCMP(_fca, _fcb)));"
+                         f" /* lahf <- {last_flag_setter} flags */")
+            i += 1
             continue
 
         # Handle jecxz/jcxz specially (not flag-based)

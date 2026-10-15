@@ -32,6 +32,13 @@ extern ptrdiff_t g_xbox_mem_offset;
 
 ULONG_PTR xbox_kernel_thunk_table[XBOX_KERNEL_THUNK_TABLE_SIZE] = {0};
 
+/* Both 0 and 0x80000000 denote an unused slot: the latter has the import
+ * marker bit set but its ordinal is zero, which is not a kernel export. */
+BOOL xbox_kernel_thunk_entry_is_empty(uint32_t entry)
+{
+    return entry == 0 || (entry & 0x7FFFFFFFu) == 0;
+}
+
 /* ============================================================================
  * Logging Implementation
  * ============================================================================ */
@@ -348,7 +355,7 @@ ULONG_PTR xbox_resolve_ordinal(ULONG ordinal)
  * runtime -- it exists to keep the table populated when there is no XBE.
  * ============================================================================ */
 
-static const ULONG g_thunk_ordinals[XBOX_KERNEL_THUNK_TABLE_SIZE] = {
+static const ULONG g_thunk_ordinals[] = {
       1,   2,   3,   4,   8,  15,  16,  17,  23,  24,   /* 0-9   */
      40,  41,  42,  44,  46,  47,  49,  62,  65,  67,   /* 10-19 */
      69,  71,  74,  81,  83,  84,  85,  86,  87,  95,   /* 20-29 */
@@ -397,6 +404,10 @@ void xbox_kernel_init(void)
     ULONG unresolved = 0;
     uint32_t thunk_base = 0;
     uint32_t thunk_count = 0;
+    const ULONG fallback_count =
+        (ULONG)(sizeof(g_thunk_ordinals) / sizeof(g_thunk_ordinals[0]));
+    ULONG active_count;
+    BOOL use_xbe_thunks;
 
     /* Initialize logging */
     InitializeCriticalSection(&g_log_cs);
@@ -427,13 +438,23 @@ void xbox_kernel_init(void)
      * bridge reads). That makes the table match any title's import order.
      * Without a mapped XBE, fall back to the static reference list below. */
     xbox_kernel_get_thunk_address(&thunk_base, &thunk_count);
-    for (ULONG i = 0; i < XBOX_KERNEL_THUNK_TABLE_SIZE; i++) {
+    use_xbe_thunks = thunk_base && thunk_count && xbox_GetMemoryBase();
+    active_count = use_xbe_thunks ? thunk_count : fallback_count;
+    if (active_count > XBOX_KERNEL_THUNK_TABLE_SIZE) {
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_THUNK,
+            "Thunk table has %u entries; clamping to capacity %u",
+            active_count, XBOX_KERNEL_THUNK_TABLE_SIZE);
+        active_count = XBOX_KERNEL_THUNK_TABLE_SIZE;
+    }
+
+    for (ULONG i = 0; i < active_count; i++) {
         ULONG ordinal;
 
-        if (thunk_base && i < thunk_count && xbox_GetMemoryBase()) {
+        if (use_xbe_thunks) {
             uint32_t entry = *(volatile uint32_t *)
                 ((uintptr_t)(thunk_base + i * 4) + g_xbox_mem_offset);
-            if (entry == 0) {
+            if (xbox_kernel_thunk_entry_is_empty(entry)) {
+                active_count = i;
                 break;  /* rest of the table is empty */
             }
             ordinal = entry & 0x7FFFFFFF;
@@ -455,7 +476,7 @@ void xbox_kernel_init(void)
 
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_THUNK,
         "Thunk table: %u/%u resolved, %u unresolved",
-        resolved, XBOX_KERNEL_THUNK_TABLE_SIZE, unresolved);
+        resolved, active_count, unresolved);
 
     if (unresolved > 0) {
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_THUNK,

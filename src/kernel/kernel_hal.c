@@ -24,12 +24,125 @@
  *   APC_LEVEL (1) - APC delivery
  *   DISPATCH_LEVEL (2) - scheduler/DPC level, no page faults allowed
  *
- * On Windows, we simulate IRQL with a thread-local variable. Raising to
- * DISPATCH_LEVEL doesn't actually prevent preemption, but the tracking
- * allows code that checks IRQL to function correctly.
+ * The Xbox has one CPU, and XDK code relies on that: raising to
+ * DISPATCH_LEVEL is how a driver keeps its own DPC, and every other thread,
+ * out of the data they share -- there is no other lock. Here guest threads,
+ * DPCs and ISRs run on host threads of their own, so a thread-local level
+ * alone protected nothing. DirectSound's voice lists showed it: its worker
+ * thread and its DPC edited them at the same time, leaving a voice that
+ * stayed "playing" forever and, in another run, a NULL link it then
+ * followed.
+ *
+ * So each level is also a lock:
+ *   DISPATCH_LEVEL and above  hold g_dispatch_cs -- DPCs run under it too
+ *   above DISPATCH_LEVEL      also hold g_interrupt_cs -- ISRs run under it,
+ *                             as does KeSynchronizeExecution's routine
+ * Both are recursive and taken in that order. The per-thread counts make a
+ * lower that the thread did not raise (an ISR entered at device level, say)
+ * release nothing it does not hold.
  * ============================================================================ */
 
 static XBOX_THREAD_LOCAL KIRQL g_current_irql = PASSIVE_LEVEL;
+static XBOX_THREAD_LOCAL int g_holds_dispatch, g_holds_interrupt;
+static CRITICAL_SECTION g_dispatch_cs, g_interrupt_cs;
+static INIT_ONCE g_irql_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK irql_locks_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    (void)once; (void)param; (void)ctx;
+    InitializeCriticalSection(&g_dispatch_cs);
+    InitializeCriticalSection(&g_interrupt_cs);
+    return TRUE;
+}
+
+static void irql_locks(void)
+{
+    InitOnceExecuteOnce(&g_irql_once, irql_locks_init, NULL, NULL);
+}
+
+/* Take or release what moving from one level to another implies. */
+static void irql_move(KIRQL from, KIRQL to)
+{
+    irql_locks();
+    if (from < DISPATCH_LEVEL && to >= DISPATCH_LEVEL) {
+        EnterCriticalSection(&g_dispatch_cs);
+        g_holds_dispatch++;
+    }
+    if (from <= DISPATCH_LEVEL && to > DISPATCH_LEVEL) {
+        EnterCriticalSection(&g_interrupt_cs);
+        g_holds_interrupt++;
+    }
+    if (from > DISPATCH_LEVEL && to <= DISPATCH_LEVEL && g_holds_interrupt) {
+        g_holds_interrupt--;
+        LeaveCriticalSection(&g_interrupt_cs);
+    }
+    if (from >= DISPATCH_LEVEL && to < DISPATCH_LEVEL && g_holds_dispatch) {
+        g_holds_dispatch--;
+        LeaveCriticalSection(&g_dispatch_cs);
+    }
+}
+
+KIRQL xbox_GetCurrentIrql(void)
+{
+    return g_current_irql;
+}
+
+/* DPCs run at DISPATCH_LEVEL: none may run while a thread is there. Returns
+ * FALSE, taking nothing, while one is; the caller keeps its DPCs queued. */
+BOOLEAN xbox_IrqlEnterDpc(KIRQL *saved)
+{
+    irql_locks();
+    if (!TryEnterCriticalSection(&g_dispatch_cs))
+        return FALSE;
+    g_holds_dispatch++;
+    *saved = g_current_irql;
+    g_current_irql = DISPATCH_LEVEL;
+    return TRUE;
+}
+
+void xbox_IrqlLeaveDpc(KIRQL saved)
+{
+    g_current_irql = saved;
+    g_holds_dispatch--;
+    LeaveCriticalSection(&g_dispatch_cs);
+}
+
+/* An ISR may defer one guest-list operation while still acknowledging its
+ * device. Never wait for dispatch ownership from interrupt level: a guest
+ * thread holding dispatch can itself be waiting for that acknowledgment.
+ * This changes ownership only, preserving the caller's device IRQL. */
+int xbox_IrqlTryEnterDispatch(void)
+{
+    irql_locks();
+    if (!TryEnterCriticalSection(&g_dispatch_cs))
+        return 0;
+    g_holds_dispatch++;
+    return 1;
+}
+
+void xbox_IrqlLeaveDispatch(void)
+{
+    g_holds_dispatch--;
+    LeaveCriticalSection(&g_dispatch_cs);
+}
+
+/* An ISR runs at its device level: above DISPATCH_LEVEL, so a thread at
+ * DISPATCH_LEVEL does not hold it off, but excluded from anything above. */
+void xbox_IrqlEnterIsr(KIRQL *saved)
+{
+    irql_locks();
+    EnterCriticalSection(&g_interrupt_cs);
+    g_holds_interrupt++;
+    *saved = g_current_irql;
+    g_current_irql = XBOX_DEVICE_IRQL;
+}
+
+void xbox_IrqlLeaveIsr(KIRQL saved)
+{
+    g_current_irql = saved;
+    g_holds_interrupt--;
+    LeaveCriticalSection(&g_interrupt_cs);
+}
 
 /*
  * KfRaiseIrql - Raises IRQL to the specified level.
@@ -45,6 +158,7 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
             old, NewIrql);
     }
 
+    irql_move(old, NewIrql);
     g_current_irql = NewIrql;
     return old;
 }
@@ -61,6 +175,7 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
             g_current_irql, NewIrql);
     }
 
+    irql_move(g_current_irql, NewIrql);
     g_current_irql = NewIrql;
 }
 
@@ -70,6 +185,7 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
 KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
 {
     KIRQL old = g_current_irql;
+    irql_move(old, DISPATCH_LEVEL);
     g_current_irql = DISPATCH_LEVEL;
     return old;
 }
@@ -478,6 +594,13 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
         *Result = AV_FLAGS_HDTV_480i | AV_FLAGS_HDTV_480p
                 | AV_FLAGS_HDTV_720p | AV_FLAGS_WIDESCREEN
                 | AV_FLAGS_60Hz;
+        break;
+
+    case AV_OPTION_GUESS_FIELD:
+        /* The Xbox query is for interlaced field parity. The host output is
+         * progressive, so it has no alternating fields; keep the guest's
+         * field value stable at zero. */
+        *Result = 0;
         break;
 
     case AV_OPTION_SET_MODE:

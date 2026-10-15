@@ -21,6 +21,7 @@
 #include "../nv2a/qemu_shim.h"
 
 #include <math.h>
+#include "apu_timing.h"
 
 /* ============================================================
  * Additional atomic ops needed by APU code
@@ -48,7 +49,7 @@ static inline int64_t qemu_clock_get_us(int type) {
     LARGE_INTEGER freq, count;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&count);
-    return (int64_t)(count.QuadPart * 1000000LL / freq.QuadPart);
+    return mcpx_apu_clock_microseconds(count.QuadPart, freq.QuadPart);
 }
 #endif
 
@@ -93,34 +94,41 @@ static inline void qemu_thread_join(QemuThread *t) {
  * We access Xbox RAM via a global pointer, same as NV2A.
  * ============================================================ */
 
-extern uint8_t *g_apu_ram_ptr; /* Set at init to point at Xbox 64MB RAM */
+/* Physical address 0 as the APU sees it (xbox_GetPhysicalMemoryBase): the
+ * title's DirectSound hands the APU physical addresses from
+ * MmGetPhysicalAddress, which point into the contiguous window. */
+extern uint8_t *g_apu_ram_ptr;
+
+/* Physical addresses decode through 128 MB: the contiguous window's 64 MB,
+ * then low RAM's own view above it (xbox_PhysicalAddressOf). */
+#define APU_PHYS_MASK 0x07FFFFFFu
 
 /* Little-endian physical memory reads */
 static inline uint32_t ldl_le_phys(void *as, hwaddr addr) {
     (void)as;
-    return *(uint32_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
+    return *(uint32_t *)(g_apu_ram_ptr + (addr & APU_PHYS_MASK));
 }
 static inline uint16_t lduw_le_phys(void *as, hwaddr addr) {
     (void)as;
-    return *(uint16_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
+    return *(uint16_t *)(g_apu_ram_ptr + (addr & APU_PHYS_MASK));
 }
 static inline uint8_t ldub_phys(void *as, hwaddr addr) {
     (void)as;
-    return *(uint8_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
+    return *(uint8_t *)(g_apu_ram_ptr + (addr & APU_PHYS_MASK));
 }
 
 /* Little-endian physical memory writes */
 static inline void stl_le_phys(void *as, hwaddr addr, uint32_t val) {
     (void)as;
-    *(uint32_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
+    *(uint32_t *)(g_apu_ram_ptr + (addr & APU_PHYS_MASK)) = val;
 }
 static inline void stw_le_phys(void *as, hwaddr addr, uint16_t val) {
     (void)as;
-    *(uint16_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
+    *(uint16_t *)(g_apu_ram_ptr + (addr & APU_PHYS_MASK)) = val;
 }
 static inline void stb_phys(void *as, hwaddr addr, uint8_t val) {
     (void)as;
-    *(uint8_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
+    *(uint8_t *)(g_apu_ram_ptr + (addr & APU_PHYS_MASK)) = val;
 }
 
 /* Stub address space - just passed to ldl_le_phys etc. (ignored) */

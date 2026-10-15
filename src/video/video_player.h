@@ -11,6 +11,8 @@
 #define XBOXRECOMP_VIDEO_PLAYER_H
 
 #include <stdint.h>
+#include <stddef.h>
+#include "fb_present.h"
 
 /* Initialize/shutdown Media Foundation (call once at app start/end) */
 int  video_init(void);
@@ -18,6 +20,18 @@ void video_shutdown(void);
 
 /* Open a video file for playback. Returns 0 on success. */
 int  video_open(const char *path);
+
+/* Host playback can decode directly into owned BGRA pixels without creating a
+ * D3D8 texture. The legacy video_open/render path keeps its texture behavior. */
+int  video_open_pixels(const char *path);
+typedef struct VideoFramePixels {
+    const void *pixels;
+    size_t bytes;
+    uint32_t width, height, pitch, aspect_width, aspect_height;
+    uint64_t sequence;
+} VideoFramePixels;
+/* Borrowed only on the decoder thread, until its next update/open/close. */
+int  video_get_frame_pixels(VideoFramePixels *frame);
 
 /* Advance playback by dt seconds, decode next frame if needed.
  * Returns 1 if a new frame is ready, 0 if unchanged, -1 if finished. */
@@ -58,8 +72,5 @@ int  video_dump_frame_bmp(const char *path);
 
 /* Show the guest framebuffer in its own window (RECOMP_FB_WINDOW). Whatever
  * the title renders into guest RAM appears there; nothing else scans it out. */
-void xbox_FramebufferWindowStart(void);
-void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
-int  xbox_FramebufferDumpBmp(const char *path);
 
 #endif /* BURNOUT3_VIDEO_PLAYER_H */

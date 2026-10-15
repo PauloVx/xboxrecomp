@@ -112,6 +112,105 @@ static uint32_t dma_resolve(uint32_t offset)
     return offset;                         /* nothing better to offer */
 }
 
+/* ── Objects and DMA contexts, as the title's D3D created them ──────────
+ *
+ * A Kelvin method in 0x180..0x1FC names an object by handle. On hardware PFIFO
+ * looks the handle up in RAMHT and hands PGRAPH the object's instance address,
+ * and a DMA object there says where that context's memory is: base, limit,
+ * target. D3D builds the hash table and the objects through the aperture while
+ * it initialises the GPU, and the aperture is plain memory in this runtime, so
+ * they are still there to be read the way the hardware reads them (xemu:
+ * ramht_hash/ramht_lookup and nv_dma_load; field layouts in nv2a_regs.h).
+ *
+ * dma_resolve() above guesses from where an offset happens to fall. A context
+ * that is looked up does not need to guess, and the one thing that cannot be
+ * guessed at all is a semaphore: BLACK's D3D waits on a fence word in
+ * contiguous memory that only BACK_END_WRITE_SEMAPHORE_RELEASE ever advances.
+ */
+#define NV2A_APERTURE_VA        0xFD000000u
+#define NV2A_PFIFO_RAMHT        0x00002210u     /* NV_PFIFO + NV_PFIFO_RAMHT */
+#define NV2A_PFIFO_CACHE1_PUSH1 0x00003204u     /* NV_PFIFO + ..._CACHE1_PUSH1 */
+#define NV2A_PRAMIN             0x00700000u
+#define NV2A_PRAMIN_SIZE        0x00100000u
+
+#define NV097_SET_CONTEXT_DMA_SEMAPHORE        0x01A4
+#define NV097_SET_SEMAPHORE_OFFSET             0x1D6C
+#define NV097_BACK_END_WRITE_SEMAPHORE_RELEASE 0x1D70
+
+static uint32_t nv2a_aperture_read(uint32_t offset)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    return *(const volatile uint32_t *)(mem + NV2A_APERTURE_VA + offset);
+}
+
+static uint32_t pramin_read(uint32_t offset)
+{
+    if (offset > NV2A_PRAMIN_SIZE - 4)
+        return 0;
+    return nv2a_aperture_read(NV2A_PRAMIN + offset);
+}
+
+/* Instance address of the object `handle` names, or ~0u if RAMHT has none. */
+static uint32_t ramht_instance(uint32_t handle)
+{
+    uint32_t ramht = nv2a_aperture_read(NV2A_PFIFO_RAMHT);
+    uint32_t size  = 0x1000u << ((ramht >> 16) & 3);      /* RAMHT_SIZE */
+    uint32_t base  = ((ramht >> 4) & 0x1F) << 12;         /* RAMHT_BASE_ADDRESS */
+    uint32_t chid  = nv2a_aperture_read(NV2A_PFIFO_CACHE1_PUSH1) & 0x1F;
+    uint32_t bits  = 0, hash = 0, h = handle, entry, context;
+
+    while ((1u << (bits + 1)) < size)
+        bits++;                                 /* log2(size) - 1 */
+    while (h) {
+        hash ^= h & ((1u << bits) - 1);
+        h >>= bits;
+    }
+    hash ^= chid << (bits - 4);
+    if (hash * 8 >= size)
+        return ~0u;
+    entry   = pramin_read(base + hash * 8);
+    context = pramin_read(base + hash * 8 + 4);
+    if (entry != handle || !(context & 0x80000000u))      /* RAMHT_STATUS */
+        return ~0u;
+    return (context & 0xFFFFu) << 4;                      /* RAMHT_INSTANCE */
+}
+
+typedef struct {
+    uint32_t cls, target, base, limit;
+} DmaObject;
+
+/* The DMA object a context handle names. 0 when there is none to read, so a
+ * caller can refuse rather than write through a made-up address. */
+static int dma_object(uint32_t handle, DmaObject *out)
+{
+    uint32_t inst = ramht_instance(handle), flags, frame;
+
+    if (inst == ~0u)
+        return 0;
+    flags = pramin_read(inst);
+    out->limit = pramin_read(inst + 4);
+    frame = pramin_read(inst + 8);
+    out->cls = flags & 0xFFF;                             /* NV_DMA_CLASS */
+    out->target = (flags >> 16) & 3;                      /* NV_DMA_TARGET */
+    out->base = (frame & 0xFFFFF000u) | (flags >> 20);    /* ADDRESS | ADJUST */
+    return 1;
+}
+
+/* Guest VA of byte `offset` in the context `handle` names, or 0. Every target
+ * is system RAM on the Xbox, and the contiguous window is its physical view. */
+static uint32_t dma_address(uint32_t handle, uint32_t offset, uint32_t bytes)
+{
+    DmaObject o;
+    uint64_t phys;
+
+    if (!dma_object(handle, &o) || (uint64_t)offset + bytes - 1 > o.limit)
+        return 0;
+    phys = (uint64_t)o.base + offset;
+    if (phys + bytes > XBOX_CONTIG_SIZE)
+        return 0;
+    return XBOX_CONTIG_BASE + (uint32_t)phys;
+}
+
 static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what)
 {
     static int said;
@@ -249,6 +348,10 @@ static struct {
     uint32_t clear_color;
     uint32_t clears, unhandled_total;
     uint32_t flip_read, flip_write, flip_modulo, flips;
+    /* SET_CONTEXT_DMA_SEMAPHORE's handle and SET_SEMAPHORE_OFFSET: where
+     * BACK_END_WRITE_SEMAPHORE_RELEASE stores its value. */
+    uint32_t dma_semaphore, semaphore_offset;
+    uint32_t semaphores, semaphores_refused;
     uint32_t tris_drawn, tris_skipped_offscreen, batches_untransformed;
     /* Why a batch came out flat. "Untextured" has two causes that look
      * identical on screen and want opposite fixes: the batch carried no
@@ -1659,6 +1762,44 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         record_tex_reg(method, param);
         break;
 
+    case NV097_SET_CONTEXT_DMA_SEMAPHORE:
+        s_gpu.dma_semaphore = param;
+        return;
+
+    case NV097_SET_SEMAPHORE_OFFSET:
+        s_gpu.semaphore_offset = param;
+        return;
+
+    case NV097_BACK_END_WRITE_SEMAPHORE_RELEASE: {
+        /* A fence. D3D's InsertFence puts one of these in the stream and
+         * BlockOnFence spins on the word it names until the value arrives --
+         * with nothing executing it, BLACK's first D3DDevice_Swap waited
+         * forever. Written here, in stream order, so a fence completes exactly
+         * when execution passes it and never before. */
+        uint32_t va = dma_address(s_gpu.dma_semaphore, s_gpu.semaphore_offset, 4);
+        uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+
+        if (!va) {
+            if (s_gpu.semaphores_refused++ < 4) {
+                fprintf(stderr, "  [GPU] semaphore release 0x%08X refused:"
+                                " context 0x%08X offset 0x%08X does not"
+                                " resolve (RAMHT 0x%08X)\n",
+                        param, s_gpu.dma_semaphore, s_gpu.semaphore_offset,
+                        nv2a_aperture_read(NV2A_PFIFO_RAMHT));
+                fflush(stderr);
+            }
+            return;
+        }
+        *(volatile uint32_t *)(mem + va) = param;
+        if (s_gpu.semaphores++ < 4) {
+            fprintf(stderr, "  [GPU] semaphore release 0x%08X -> 0x%08X"
+                            " (context 0x%08X + 0x%X)\n",
+                    param, va, s_gpu.dma_semaphore, s_gpu.semaphore_offset);
+            fflush(stderr);
+        }
+        return;
+    }
+
     case NV097_SET_FLIP_READ:
         s_gpu.flip_read = param;
         return;
@@ -1930,6 +2071,9 @@ void nv2a_pb_exec_report(void)
             s_gpu.color_offset, s_gpu.pitch, s_gpu.clip_w, s_gpu.clip_h,
             s_gpu.clip_x, s_gpu.clip_y, s_gpu.clears,
             s_gpu.unhandled_total, s_unhandled_count);
+    fprintf(stderr, "[GPU] semaphore releases %u written, %u refused;"
+                    " flips %u\n",
+            s_gpu.semaphores, s_gpu.semaphores_refused, s_gpu.flips);
     fprintf(stderr, "[GPU] draws %u (%u with coordinates), %u indices;"
                     " x %.1f..%.1f  y %.1f..%.1f\n",
             s_gpu.draws, s_gpu.nonzero_draws, s_gpu.verts,

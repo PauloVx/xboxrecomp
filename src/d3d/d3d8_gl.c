@@ -47,11 +47,11 @@
 
 /* Window title for the SDL window, configurable per title via
  * xbox_D3D8SetWindowTitle(). Default is a generic name. */
-static const char *g_window_title = "Xbox Game";
+static const char *g_window_title = "PC Game";
 
 void xbox_D3D8SetWindowTitle(const char *title)
 {
-    g_window_title = (title && title[0]) ? title : "Xbox Game";
+    g_window_title = (title && title[0]) ? title : "PC Game";
 }
 #define MAX_TSS   33
 #define MAX_TSU   8     /* texture stages */

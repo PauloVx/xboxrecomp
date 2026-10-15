@@ -66,9 +66,21 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
  * Filter helpers
  * ============================================================ */
 
-static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
+static void voice_reset_resample(MCPXAPUState *d, uint16_t v)
 {
     assert(v < MCPX_HW_MAX_VOICES);
+    MCPXAPUVoiceFilter *filter = &d->vp.filters[v];
+    filter->resample_count = filter->resample_pos = 0;
+    filter->resample_phase = 0.0;
+    filter->resample_have_current = filter->resample_have_next = false;
+    filter->resample_source_done = false;
+    filter->resample_fetched = filter->resample_index = 0;
+    filter->resample_notify_pending = 0;
+}
+
+static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
+{
+    voice_reset_resample(d, v);
     memset(&d->vp.filters[v].svf, 0, sizeof(d->vp.filters[v].svf));
     hrtf_filter_clear_history(&d->vp.filters[v].hrtf);
     if (d->vp.filters[v].resampler) {
@@ -120,12 +132,86 @@ static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
                 v | ((val << ctz32(mask)) & mask));
 }
 
+/* Opt-in lifecycle diagnostics for short menu sounds that process polling
+ * misses. No per-sample output: cap the events for a whole process. The
+ * playback endpoints are auxiliary trace state, not guest/APU state. */
+static float s_voice_trace_last[MCPX_HW_MAX_VOICES][2];
+static float s_voice_trace_peak[MCPX_HW_MAX_VOICES];
+static bool s_voice_trace_played[MCPX_HW_MAX_VOICES];
+
+static unsigned voice_event_trace_limit(void)
+{
+    static int limit = -1;
+    if (limit < 0) {
+        const char *enabled = getenv("RECOMP_APU_TRACE_VOICE_EVENTS");
+        limit = 0;
+        if (enabled && strcmp(enabled, "1") == 0) {
+            const char *maximum = getenv("RECOMP_APU_TRACE_VOICE_EVENTS_MAX");
+            long requested = maximum ? strtol(maximum, NULL, 10) : 512;
+            if (requested < 1) requested = 512;
+            if (requested > 16384) requested = 16384;
+            limit = (int)requested;
+        }
+    }
+    return (unsigned)limit;
+}
+
+static void voice_event_trace(MCPXAPUState *d, uint16_t v,
+                              const char *event)
+{
+    static unsigned events;
+    unsigned limit = voice_event_trace_limit();
+    if (!limit || events >= limit || v >= MCPX_HW_MAX_VOICES) return;
+    MCPXAPUVoiceFilter *f = &d->vp.filters[v];
+    ++events;
+    fprintf(stderr, "[VPEVENT] n=%u us=%lld tick=%u event=%s v=%u"
+            " FECTL=%08X FMT=%08X MISC=%08X STATE=%08X BA=%08X"
+            " LBO=%08X OFFSET=%08X NEXT=%08X PITCH=%08X ECNT=%08X"
+            " ENV0=%08X ENVA=%08X ENV1=%08X ENVF=%08X LFO=%08X"
+            " FCA=%08X FCB=%08X VBIN=%08X VOLA=%08X VOLB=%08X VOLC=%08X"
+            " queued=%d phase=%.9g cached=%d/%d fetched=%llu index=%llu eof=%u"
+            " pair=%u%u notices=%u played=%u last=%.9g,%.9g peak=%.9g\n",
+            events, (long long)qemu_clock_get_us(QEMU_CLOCK_REALTIME),
+            d->ep_frame_div, event, v, d->regs[NV_PAPU_FECTL],
+            voice_get_mask(d,v,NV_PAVS_VOICE_CFG_FMT,0xffffffffu),
+            voice_get_mask(d,v,NV_PAVS_VOICE_CFG_MISC,0xffffffffu),
+            voice_get_mask(d,v,NV_PAVS_VOICE_PAR_STATE,0xffffffffu),
+            voice_get_mask(d,v,NV_PAVS_VOICE_CUR_PSL_START,0xffffffffu),
+            voice_get_mask(d,v,NV_PAVS_VOICE_CUR_PSH_SAMPLE,0xffffffffu),
+            voice_get_mask(d,v,NV_PAVS_VOICE_PAR_OFFSET,0xffffffffu),
+            voice_get_mask(d,v,NV_PAVS_VOICE_PAR_NEXT,0xffffffffu),
+            voice_get_mask(d,v,NV_PAVS_VOICE_TAR_PITCH_LINK,0xffffffffu),
+            voice_get_mask(d,v,NV_PAVS_VOICE_CUR_ECNT,0xffffffffu),
+            voice_get_mask(d,v,NV_PAVS_VOICE_CFG_ENV0,0xffffffffu),
+            voice_get_mask(d,v,NV_PAVS_VOICE_CFG_ENVA,0xffffffffu),
+            voice_get_mask(d,v,NV_PAVS_VOICE_CFG_ENV1,0xffffffffu),
+            voice_get_mask(d,v,NV_PAVS_VOICE_CFG_ENVF,0xffffffffu),
+            voice_get_mask(d,v,NV_PAVS_VOICE_TAR_LFO_ENV,0xffffffffu),
+            voice_get_mask(d,v,NV_PAVS_VOICE_TAR_FCA,0xffffffffu),
+            voice_get_mask(d,v,NV_PAVS_VOICE_TAR_FCB,0xffffffffu),
+            voice_get_mask(d,v,NV_PAVS_VOICE_CFG_VBIN,0xffffffffu),
+            voice_get_mask(d,v,NV_PAVS_VOICE_TAR_VOLA,0xffffffffu),
+            voice_get_mask(d,v,NV_PAVS_VOICE_TAR_VOLB,0xffffffffu),
+            voice_get_mask(d,v,NV_PAVS_VOICE_TAR_VOLC,0xffffffffu),
+            d->vp.voice_work_dispatch.queue_len,
+            f->resample_phase, f->resample_pos, f->resample_count,
+            (unsigned long long)f->resample_fetched,
+            (unsigned long long)f->resample_index, f->resample_source_done,
+            f->resample_have_current, f->resample_have_next,
+            f->resample_notify_pending, s_voice_trace_played[v],
+            s_voice_trace_last[v][0], s_voice_trace_last[v][1],
+            s_voice_trace_peak[v]);
+    if (events == limit)
+        fprintf(stderr, "[VPEVENT] event limit reached (%u)\n", limit);
+}
+
 /* ============================================================
  * Voice off / lock
  * ============================================================ */
 
 static void voice_off(MCPXAPUState *d, uint16_t v)
 {
+    voice_event_trace(d, v, "off");
     voice_set_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 0);
 
@@ -178,12 +264,49 @@ static void set_hrir_coeff_tar(MCPXAPUState *d, int channel, int coeff_idx,
  * Front-End method dispatch
  * ============================================================ */
 
+/* RECOMP_APU_TRACE_IRQ: the first front-end methods, and once a second how
+ * many voices the processor found active -- together they say whether a
+ * silent title is not starting voices or the voices are not being run. */
+static int apu_trace(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("RECOMP_APU_TRACE_IRQ") != NULL;
+    }
+    return on;
+}
+
+static volatile uint64_t g_vp_idle_traps;  /* SE2FE_IDLE_VOICE traps raised */
+
 static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 {
     unsigned int slot;
 
-    d->regs[NV_PAPU_FEDECMETH] = method;
-    d->regs[NV_PAPU_FEDECPARAM] = argument;
+    if (apu_trace() && method != SE2FE_IDLE_VOICE) {
+        /* Buffer mapping (SET_CURRENT_INBUF_SGE and its offset, 0x804/0x808)
+         * comes in thousands per stream and would spend the whole budget
+         * before the first voice is stopped, so it has its own. */
+        static unsigned said, said_sge;
+        int sge = method == 0x0804 || method == 0x0808;
+        if (sge ? said_sge++ < 64 : said++ < 4000) {
+            fprintf(stderr, "[APU] method %04X arg %08X\n", method, argument);
+        }
+    }
+
+    /* An idle-voice trap belongs to the title until it releases FECTL's
+     * trapped mode. The ISR reads these two registers separately; another
+     * guest thread's PIO command must not replace either half meanwhile.
+     * Ordinary commands still run below, since this port executes PIO
+     * directly rather than modelling the hardware's command queue. */
+    bool trapped = (qatomic_read(&d->regs[NV_PAPU_FECTL]) &
+                    NV_PAPU_FECTL_FEMETHMODE) ==
+                   NV_PAPU_FECTL_FEMETHMODE_TRAPPED;
+    if (!trapped) {
+        qatomic_set(&d->regs[NV_PAPU_FEDECMETH], method);
+        qatomic_set(&d->regs[NV_PAPU_FEDECPARAM], argument);
+    } else if (method == SE2FE_IDLE_VOICE) {
+        return;
+    }
     unsigned int selected_handle, list;
 
     switch (method) {
@@ -197,6 +320,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     case NV1BA0_PIO_VOICE_ON: {
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
+        voice_event_trace(d, (uint16_t)selected_handle, "on-before");
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
         if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
@@ -276,12 +400,21 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         voice_set_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_PAR_STATE,
                        NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 1);
 
+        if (voice_event_trace_limit()) {
+            s_voice_trace_played[selected_handle] = false;
+            s_voice_trace_peak[selected_handle] = 0;
+            s_voice_trace_last[selected_handle][0] = 0;
+            s_voice_trace_last[selected_handle][1] = 0;
+        }
+        voice_event_trace(d, (uint16_t)selected_handle, "on-after");
+
         if (!locked) voice_lock(d, (uint16_t)selected_handle, false);
         break;
     }
 
     case NV1BA0_PIO_VOICE_RELEASE: {
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
+        voice_event_trace(d, (uint16_t)selected_handle, "release");
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
         if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
@@ -308,6 +441,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     }
 
     case NV1BA0_PIO_VOICE_OFF:
+        voice_event_trace(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_OFF_HANDLE), "pio-off");
         voice_off(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_OFF_HANDLE));
         break;
 
@@ -412,9 +546,12 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                        NV_PAVS_VOICE_CUR_PSH_SAMPLE_LBO, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_BUF_CBO:
+        voice_event_trace(d, (uint16_t)d->regs[NV_PAPU_FECV], "seek-before");
         voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
                        NV_PAVS_VOICE_PAR_OFFSET,
                        NV_PAVS_VOICE_PAR_OFFSET_CBO, argument);
+        voice_reset_resample(d, (uint16_t)d->regs[NV_PAPU_FECV]);
+        voice_event_trace(d, (uint16_t)d->regs[NV_PAPU_FECV], "seek-after");
         break;
     case NV1BA0_PIO_SET_VOICE_CFG_BUF_EBO:
         voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
@@ -487,12 +624,26 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         break;
 
     case SE2FE_IDLE_VOICE:
+        if (apu_trace()) {
+            static unsigned said_idle;
+            if (said_idle++ < 32)
+                fprintf(stderr, "[APU] idle voice %u in a list (%s)\n", argument,
+                        (d->regs[NV_PAPU_FETFORCE1] &
+                         NV_PAPU_FETFORCE1_SE2FE_IDLE_VOICE)
+                            ? "trapped to the title" : "not trapped");
+        }
         if (d->regs[NV_PAPU_FETFORCE1] & NV_PAPU_FETFORCE1_SE2FE_IDLE_VOICE) {
-            d->regs[NV_PAPU_FECTL] &= ~NV_PAPU_FECTL_FEMETHMODE;
-            d->regs[NV_PAPU_FECTL] |= NV_PAPU_FECTL_FEMETHMODE_TRAPPED;
-            d->regs[NV_PAPU_FECTL] &= ~NV_PAPU_FECTL_FETRAPREASON;
-            d->regs[NV_PAPU_FECTL] |= NV_PAPU_FECTL_FETRAPREASON_REQUESTED;
+            uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
+            fectl &= ~(NV_PAPU_FECTL_FEMETHMODE | NV_PAPU_FECTL_FETRAPREASON);
+            fectl |= NV_PAPU_FECTL_FEMETHMODE_TRAPPED |
+                     NV_PAPU_FECTL_FETRAPREASON_REQUESTED;
+            /* The shim's qatomic_set is a plain store. Publish trapped mode
+             * with a barrier so the payload stores precede it on the host. */
+            InterlockedExchange((volatile LONG *)&d->regs[NV_PAPU_FECTL],
+                                (LONG)fectl);
+            voice_event_trace(d, (uint16_t)argument, "idle-trap");
             d->set_irq = true;
+            g_vp_idle_traps++;
         }
         break;
 
@@ -567,8 +718,13 @@ void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val,
     MCPXAPUState *d = (MCPXAPUState *)opaque;
     (void)size;
 
-    /* Dispatch known methods through fe_method */
+    /* The frame thread holds this lock while publishing an idle trap. PIO
+     * calls arrive from several host threads, unlike the original CPU, and
+     * must not race that publication or one another. The shim's mutex is
+     * recursive, as VOICE_LOCK also takes it. */
+    qemu_mutex_lock(&d->lock);
     fe_method(d, (uint32_t)addr, (uint32_t)val);
+    qemu_mutex_unlock(&d->lock);
 }
 
 /* ============================================================
@@ -797,7 +953,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
             d->vp.ssl[v].ssl_seg = 0;
             if (!persist) {
                 d->vp.ssl[v].ssl_index = 0;
-                voice_off(d, (uint16_t)v);
+                d->vp.filters[v].resample_source_done = true;
             } else {
                 set_notify_status(d, v, MCPX_HW_NOTIFIER_SSLA_DONE +
                                   d->vp.ssl[v].ssl_index,
@@ -843,7 +999,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 uint32_t linear_addr = block_index * (uint32_t)block_size;
                 if (stream) {
                     hwaddr addr = segment_offset + linear_addr;
-                    memcpy(adpcm_block, &d->ram_ptr[addr & 0x03FFFFFF],
+                    memcpy(adpcm_block, &d->ram_ptr[addr & APU_PHYS_MASK],
                            block_size);
                 } else {
                     linear_addr += ba;
@@ -911,7 +1067,8 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         }
     }
 
-    if (cbo >= ebo) {
+    /* EBO is inclusive: reaching its sample does not finish it yet. */
+    if (cbo > ebo) {
         if (stream) {
             d->vp.ssl[v].ssl_seg += 1;
             cbo = 0;
@@ -921,15 +1078,19 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 int next_index = (ssl_index + 1) % 2;
                 d->vp.ssl[v].ssl_index = next_index;
                 d->vp.ssl[v].ssl_seg = 0;
-                set_notify_status(d, v, MCPX_HW_NOTIFIER_SSLA_DONE + ssl_index,
-                                  NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
+                MCPXAPUVoiceFilter *filter = &d->vp.filters[v];
+                filter->resample_notify_boundary[ssl_index] =
+                    filter->resample_fetched + sample_count;
+                filter->resample_notify_pending |= 1u << ssl_index;
             }
         } else {
             if (loop) {
                 cbo = lbo;
             } else {
                 cbo = ebo;
-                voice_off(d, (uint16_t)v);
+                /* The resampler may still have this tail buffered. Complete
+                 * the voice when playback, rather than prefetch, reaches it. */
+                d->vp.filters[v].resample_source_done = true;
             }
         }
     }
@@ -940,32 +1101,122 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
 }
 
 /* ============================================================
- * Voice resampling (simplified - no libsamplerate)
- *
- * Since libsamplerate is stubbed, we do a simple nearest-neighbor
- * resample. This gives us functional audio at the cost of quality.
+ * Voice resampling. Pitch ratio is output/source; source step is its inverse.
+ * Keep the source cursor and interpolation pair across frames, including
+ * loop and SSL boundaries. Decode in blocks to avoid repeatedly decoding
+ * an ADPCM block for every output sample.
  * ============================================================ */
+
+static bool voice_resample_source(MCPXAPUState *d, uint16_t v, float sample[2])
+{
+    MCPXAPUVoiceFilter *filter = &d->vp.filters[v];
+    if (filter->resample_pos == filter->resample_count) {
+        if (filter->resample_source_done) return false;
+        int count = voice_get_samples(d, v,
+            (float (*)[2])filter->resample_buf, NUM_SAMPLES_PER_FRAME);
+        if (count <= 0) return false;
+        filter->resample_pos = 0;
+        filter->resample_count = count;
+        filter->resample_fetched += count;
+    }
+    sample[0] = filter->resample_buf[2 * filter->resample_pos];
+    sample[1] = filter->resample_buf[2 * filter->resample_pos + 1];
+    filter->resample_pos++;
+    return true;
+}
+
+static bool voice_resample_advance(MCPXAPUState *d, uint16_t v)
+{
+    MCPXAPUVoiceFilter *filter = &d->vp.filters[v];
+    while (filter->resample_phase >= 1.0) {
+        filter->resample_phase -= 1.0;
+        filter->resample_index++;
+        filter->resample_have_current = false;
+        if (filter->resample_have_next) {
+            memcpy(filter->resample_current, filter->resample_next,
+                   sizeof(filter->resample_current));
+            filter->resample_have_next = false;
+        } else if (!voice_resample_source(d, v, filter->resample_current)) {
+            if (filter->resample_source_done) {
+                voice_off(d, v);
+            }
+            /* A persistent stream may supply its next SSL on a later frame.
+             * Preserve phase at the missing boundary until it arrives. */
+            return false;
+        }
+        filter->resample_have_current = true;
+    }
+    return true;
+}
 
 static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
                           int requested_num, float rate)
 {
-    /* Without libsamplerate, just fetch raw samples at native rate.
-     * Rate < 1.0 means we need more source samples than output samples.
-     * For initial functionality, just get the samples directly. */
-    int sample_count = 0;
-    while (sample_count < requested_num) {
-        int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
-                                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
-        if (!active) break;
+    MCPXAPUVoiceFilter *filter = &d->vp.filters[v];
+    if (!isfinite(rate) || rate <= 0.0f ||
+        voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                       NV_PAVS_VOICE_PAR_STATE_PAUSED) ||
+        !voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                        NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) return -1;
 
-        int count = voice_get_samples(d, v, &samples[sample_count],
-                                      requested_num - sample_count);
-        if (count < 0) break;
-        if (count == 0) return -1;
-        sample_count += count;
+    double step = 1.0 / (double)rate;
+    bool trace_playback = voice_event_trace_limit() != 0;
+    int sample_count = 0;
+    if (!filter->resample_have_current) {
+        if (!voice_resample_source(d, v, filter->resample_current)) {
+            if (filter->resample_source_done) voice_off(d, v);
+            return -1;
+        }
+        filter->resample_have_current = true;
     }
-    (void)rate; /* Ignored until we add proper resampling */
-    return sample_count;
+    while (sample_count < requested_num) {
+        if (!voice_resample_advance(d, v)) break;
+        if (filter->resample_phase > 0.0 && !filter->resample_have_next) {
+            filter->resample_have_next =
+                voice_resample_source(d, v, filter->resample_next);
+            /* If the next SSL is not supplied yet, hold this endpoint for
+             * its remaining duration. Its DONE can then release the guest
+             * buffer; stop only when playback actually needs the next one. */
+        }
+        float fraction = (float)filter->resample_phase;
+        for (int ch = 0; ch < 2; ch++) {
+            float a = filter->resample_current[ch];
+            float b = filter->resample_have_next ? filter->resample_next[ch] : a;
+            samples[sample_count][ch] = a + (b - a) * fraction;
+        }
+        if (trace_playback) {
+            s_voice_trace_last[v][0] = samples[sample_count][0];
+            s_voice_trace_last[v][1] = samples[sample_count][1];
+            s_voice_trace_peak[v] = fmaxf(s_voice_trace_peak[v],
+                fmaxf(fabsf(samples[sample_count][0]),
+                      fabsf(samples[sample_count][1])));
+            if (!s_voice_trace_played[v]) {
+                s_voice_trace_played[v] = true;
+                voice_event_trace(d, v, "first-output");
+            }
+        }
+        sample_count++;
+        filter->resample_phase += step;
+        double played = (double)filter->resample_index + filter->resample_phase;
+        for (int ssl = 0; ssl < MCPX_HW_SSLS_PER_VOICE; ssl++) {
+            if ((filter->resample_notify_pending & (1u << ssl)) &&
+                played >= (double)filter->resample_notify_boundary[ssl]) {
+                filter->resample_notify_pending &= ~(1u << ssl);
+                set_notify_status(d, v, MCPX_HW_NOTIFIER_SSLA_DONE + ssl,
+                                  NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
+            }
+        }
+        /* Do not fetch the next source block until an output needs it.
+         * Completion and SSL notifications follow playback, not lookahead. */
+        if (filter->resample_source_done &&
+            played >= (double)filter->resample_fetched) {
+            filter->resample_have_current = false;
+            voice_event_trace(d, v, "playback-eof");
+            voice_off(d, v);
+            break;
+        }
+    }
+    return sample_count ? sample_count : -1;
 }
 
 /* ============================================================
@@ -1041,17 +1292,13 @@ static void voice_process(MCPXAPUState *d,
         for (int sample_count = 0; sample_count < NUM_SAMPLES_PER_FRAME;) {
             int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                         NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
-            if (!active) return;
+            if (!active) break;
             int count = voice_resample(d, v, &samples[sample_count],
                                        NUM_SAMPLES_PER_FRAME - sample_count, rate);
             if (count < 0) break;
             sample_count += count;
         }
     }
-
-    int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
-                                NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
-    if (!active) return;
 
     /* Get volume bins */
     int bin[8];
@@ -1169,39 +1416,169 @@ static void voice_process(MCPXAPUState *d,
  * Simplified single-threaded version (no worker threads initially)
  * ============================================================ */
 
+/* For a hang report: the front end's state and every voice on a list, with
+ * the bits that decide whether it will ever leave -- active, paused, and
+ * where its envelopes are. A stop that never completes is a voice that stays
+ * active (its release never ends) or an idle one the title never takes off
+ * its list, and this says which. */
+static volatile uint64_t g_vp_frames;      /* frames the VP has run */
+extern volatile uint64_t g_apu_frames_full, g_apu_frames_monitor;
+static volatile int g_vp_waiting_on = -1;  /* voice a frame waits on, or -1 */
+
+void mcpx_apu_dump_state(void)
+{
+    MCPXAPUState *d = g_state;
+    int list;
+
+    if (!d)
+        return;
+    fprintf(stderr, "  APU: FECTL %08X ISTS %08X IEN %08X FEDECMETH %08X"
+                    " FEDECPARAM %08X FETFORCE1 %08X\n",
+            d->regs[NV_PAPU_FECTL], d->regs[NV_PAPU_ISTS], d->regs[NV_PAPU_IEN],
+            d->regs[NV_PAPU_FEDECMETH], d->regs[NV_PAPU_FEDECPARAM],
+            d->regs[NV_PAPU_FETFORCE1]);
+    fprintf(stderr, "  APU: SECTL %08X, %s, %llu VP frames run",
+            d->regs[NV_PAPU_SECTL],
+            d->pause_requested ? "paused" : "running",
+            (unsigned long long)g_vp_frames);
+    if (g_vp_waiting_on >= 0)
+        fprintf(stderr, ", waiting on locked voice %d", g_vp_waiting_on);
+    fprintf(stderr, "; frame thread: %llu full, %llu monitor-only;"
+                    " %llu idle-voice traps\n",
+            (unsigned long long)g_apu_frames_full,
+            (unsigned long long)g_apu_frames_monitor,
+            (unsigned long long)g_vp_idle_traps);
+    for (list = 0; list < 3; list++) {
+        uint32_t v = d->regs[voice_list_regs[list].top];
+        int n = 0;
+
+        fprintf(stderr, "  APU list %d:", list);
+        while (v != 0xFFFF && n++ < 32) {
+            uint32_t st = voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_STATE,
+                                         0xFFFFFFFFu);
+            uint32_t ecnt = voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_CUR_ECNT,
+                                           0xFFFFFFFFu);
+            fprintf(stderr, " %u[%s%s ea%u ef%u ecnt %08X]", v,
+                    (st & NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE) ? "active" : "idle",
+                    (st & NV_PAVS_VOICE_PAR_STATE_PAUSED) ? " paused" : "",
+                    (st >> 28) & 0xF, (st >> 24) & 0xF, ecnt);
+            v = voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_TAR_PITCH_LINK,
+                               NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
+        }
+        fprintf(stderr, "\n");
+    }
+    fflush(stderr);
+}
+
 void mcpx_apu_vp_frame(MCPXAPUState *d,
                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
+    VoiceWorkDispatch *vwd = &d->vp.voice_work_dispatch;
+
+    if ((qatomic_read(&d->regs[NV_PAPU_FECTL]) &
+         NV_PAPU_FECTL_FEMETHMODE) == NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
+        return;
+    }
+
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
 
+    /* Walk the lists first and process after, as xemu's voice_work_dispatch
+     * does, so the frame can wait for voices the title has locked. A title
+     * locks a voice (NV1BA0_PIO_VOICE_LOCK, and VOICE_ON/VOICE_RELEASE lock it
+     * themselves) while it rewrites its state from its own thread; processing
+     * it meanwhile is a read-modify-write of the same words, and whichever
+     * write lands last wins. Single-threaded, this port had dropped xemu's
+     * wait along with its worker threads. */
+    vwd->queue_len = 0;
+    bool idle_trap_pending = false;
     for (int list = 0; list < 3; list++) {
         hwaddr top, current, next;
         top = voice_list_regs[list].top;
         current = voice_list_regs[list].current;
         next = voice_list_regs[list].next;
 
-        d->regs[current] = d->regs[top];
+        uint32_t cursor = d->regs[top];
+        if (!idle_trap_pending) d->regs[current] = cursor;
 
-        for (int i = 0; d->regs[current] != 0xFFFF; i++) {
+        for (int i = 0; cursor != 0xFFFF; i++) {
             if (i >= MCPX_HW_MAX_VOICES) {
                 DPRINTF("Voice list contains invalid entry!\n");
                 break;
             }
 
-            uint16_t v = (uint16_t)d->regs[current];
-            d->regs[next] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
+            uint16_t v = (uint16_t)cursor;
+            uint32_t next_voice = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
                                NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
+            if (!idle_trap_pending) d->regs[next] = next_voice;
 
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
-                fe_method(d, SE2FE_IDLE_VOICE, v);
-            } else {
-                /* Process voice directly (single-threaded) */
-                voice_process(d, mixbins, d->vp.sample_buf, v, list);
+                if (!idle_trap_pending) {
+                    fe_method(d, SE2FE_IDLE_VOICE, v);
+                    /* Keep the one trap payload and its unlink cursors, but
+                     * finish this tick's active-voice queue with a local
+                     * cursor. Stopping here discarded ongoing voices later
+                     * in this list and every following list for 32 samples.
+                     * Later idle voices remain linked for a future trap. */
+                    if ((qatomic_read(&d->regs[NV_PAPU_FECTL]) &
+                         NV_PAPU_FECTL_FEMETHMODE) ==
+                        NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
+                        idle_trap_pending = true;
+                        voice_event_trace(d, v, "trap-queue-continue");
+                    }
+                }
+            } else if (vwd->queue_len < MCPX_HW_MAX_VOICES) {
+                vwd->queue[vwd->queue_len].voice = v;
+                vwd->queue[vwd->queue_len].list = list;
+                vwd->queue_len++;
             }
-            d->regs[current] = d->regs[next];
+            cursor = next_voice;
+            if (!idle_trap_pending) d->regs[current] = cursor;
         }
     }
+
+    /* Wait, with d->lock released, until the title unlocks every voice about
+     * to be processed. */
+    for (;;) {
+        int i, locked = 0;
+        if (qatomic_read(&d->pause_requested) || qatomic_read(&d->exiting)) {
+            vwd->queue_len = 0;
+            break;
+        }
+        for (i = 0; i < vwd->queue_len && !locked; i++) {
+            if (is_voice_locked(d, (uint16_t)vwd->queue[i].voice)) {
+                locked = 1;
+                g_vp_waiting_on = vwd->queue[i].voice;
+            }
+        }
+        if (!locked)
+            break;
+        /* The ISR may own the unlock. A just-created idle trap cannot wait
+         * for this frame to finish before its device line is asserted. */
+        mcpx_apu_publish_pending_irq(d);
+        qemu_cond_timedwait(&d->cond, &d->lock, 1);
+    }
+    g_vp_waiting_on = -1;
+    g_vp_frames++;
+
+    for (int q = 0; q < vwd->queue_len; q++) {
+        uint16_t v = (uint16_t)vwd->queue[q].voice;
+        int list = vwd->queue[q].list;
+        /* Process voice directly (single-threaded) */
+        voice_process(d, mixbins, d->vp.sample_buf, v, list);
+        if (apu_trace()) {
+            static uint64_t processed, last_ms;
+            uint64_t now = GetTickCount64();
+            processed++;
+            if (now - last_ms >= 1000) {
+                fprintf(stderr, "[APU] voices processed so far: %llu"
+                                " (last voice %u, list %d)\n",
+                        (unsigned long long)processed, v, list);
+                last_ms = now;
+            }
+        }
+    }
+    vwd->queue_len = 0;
 
     /* VP monitor output */
     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {
@@ -1243,5 +1620,6 @@ void mcpx_apu_vp_reset(MCPXAPUState *d)
     memset(d->vp.voice_locked, 0, sizeof(d->vp.voice_locked));
     for (int v = 0; v < MCPX_HW_MAX_VOICES; v++) {
         hrtf_filter_init(&d->vp.filters[v].hrtf);
+        voice_reset_filters(d, (uint16_t)v);
     }
 }

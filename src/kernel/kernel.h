@@ -56,6 +56,9 @@ enum {
 #define PASSIVE_LEVEL   0
 #define APC_LEVEL       1
 #define DISPATCH_LEVEL  2
+/* Where an ISR runs here: any device level, since only "above DISPATCH_LEVEL"
+ * is modelled (see kernel_hal.c). */
+#define XBOX_DEVICE_IRQL 26
 
 /*
  * NTSTATUS codes - guard each against Windows SDK redefinition.
@@ -496,6 +499,7 @@ void xbox_kernel_set_thunk_address(uint32_t xbox_va, uint32_t count);
  * zeroed if never configured.
  */
 void xbox_kernel_get_thunk_address(uint32_t *xbox_va, uint32_t *count);
+BOOL xbox_kernel_thunk_entry_is_empty(uint32_t entry);
 
 extern ULONG_PTR xbox_kernel_thunk_table[XBOX_KERNEL_THUNK_TABLE_SIZE];
 
@@ -748,6 +752,8 @@ NTSTATUS __stdcall xbox_NtReleaseMutant(HANDLE MutantHandle, PLONG PreviousCount
 
 LONG     __stdcall xbox_KeSetEvent(PVOID Event, LONG Increment, BOOLEAN Wait);
 NTSTATUS __stdcall xbox_KeWaitForSingleObject(PVOID Object, ULONG WaitReason, KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Timeout);
+/* An NT timeout (NULL, relative negative or absolute 100 ns) in milliseconds. */
+DWORD xbox_nt_timeout_to_ms(PLARGE_INTEGER Timeout);
 NTSTATUS __stdcall xbox_KeWaitForMultipleObjects(ULONG Count, PVOID Objects[], ULONG WaitType, ULONG WaitReason, KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Timeout, PVOID WaitBlockArray);
 
 BOOLEAN  __stdcall xbox_KeCancelTimer(PXBOX_KTIMER Timer);
@@ -778,6 +784,13 @@ BOOLEAN __stdcall xbox_HalIsResetOrShutdownPending(void);
 KIRQL   __fastcall xbox_KfRaiseIrql(KIRQL NewIrql);
 VOID    __fastcall xbox_KfLowerIrql(KIRQL NewIrql);
 KIRQL   __stdcall xbox_KeRaiseIrqlToDpcLevel(void);
+KIRQL   xbox_GetCurrentIrql(void);
+BOOLEAN xbox_IrqlEnterDpc(KIRQL *saved);
+void    xbox_IrqlLeaveDpc(KIRQL saved);
+int     xbox_IrqlTryEnterDispatch(void);
+void    xbox_IrqlLeaveDispatch(void);
+void    xbox_IrqlEnterIsr(KIRQL *saved);
+void    xbox_IrqlLeaveIsr(KIRQL saved);
 
 VOID    __stdcall xbox_KeStallExecutionProcessor(ULONG MicroSeconds);
 LARGE_INTEGER __stdcall xbox_KeQueryPerformanceCounter(void);
@@ -792,6 +805,22 @@ VOID    __stdcall xbox_KeBugCheckEx(ULONG BugCheckCode, ULONG_PTR Param1, ULONG_
 
 VOID    __stdcall xbox_KeInitializeInterrupt(PXBOX_KINTERRUPT Interrupt, PVOID ServiceRoutine, PVOID ServiceContext, ULONG Vector, KIRQL Irql, ULONG InterruptMode, BOOLEAN ShareVector);
 BOOLEAN __stdcall xbox_KeConnectInterrupt(PXBOX_KINTERRUPT Interrupt);
+
+/* A device model's interrupt line, level-triggered. Assert it while the
+ * device has an enabled interrupt pending; the kernel's interrupt thread runs
+ * the ISR connected on that vector for as long as it stays asserted. Safe to
+ * call from any host thread, including from inside a trapped register access
+ * made by the ISR itself. */
+void xbox_SetInterruptLine(uint32_t vector, int asserted);
+/* Optional device serialization for one complete guest ISR. Registered before
+ * activating its line, or after delivery has stopped; never change/retire the
+ * callbacks or context while a service may run. Enter/leave must be paired.
+ * The kernel invokes them inside ISR IRQL: IRQL ->device lock, then reverse.
+ * DPC draining is outside this guard. NULL/NULL removes a quiescent guard. */
+BOOLEAN xbox_SetInterruptServiceGuard(uint32_t vector,
+                                     void (*enter)(void *),
+                                     void (*leave)(void *), void *context);
+#define XBOX_APU_VECTOR 5u    /* MCPX APU */
 
 /* KeTickCount - exported as a data pointer, not a function */
 extern volatile ULONG xbox_KeTickCount;
@@ -959,6 +988,7 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
 #define AV_OPTION_FLICKER_FILTER        0x0B
 #define AV_OPTION_ZERO_MODE             0x0D
 #define AV_OPTION_QUERY_MODE_CAPS       0x0E
+#define AV_OPTION_GUESS_FIELD           0x0F
 
 /* ---- AV flags (for capabilities / display mode) ---- */
 #define AV_FLAGS_HDTV_480i      0x00000001
@@ -1021,6 +1051,12 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
 #define XC_MISC                   0x11
 #define XC_DVD_REGION             0x12
 #define XC_MAX_OS                 0xFF
+/* Factory section of the EEPROM, written at manufacture. */
+#define XC_FACTORY_SERIAL_NUMBER  0x100
+#define XC_FACTORY_ETHERNET_ADDR  0x101
+#define XC_FACTORY_ONLINE_KEY     0x102
+#define XC_FACTORY_AV_REGION      0x103
+#define XC_FACTORY_GAME_REGION    0x104
 
 /* Older spellings kept so existing call sites still build. */
 #define XC_PARENTAL_CONTROL       XC_P_CONTROL_GAMES

@@ -349,6 +349,7 @@ def main():
             funcs = funcs[:args.max_funcs]
 
         manual = set()
+        wrapped = {}    # {addr: wrapper name}, from --exclude-manual
         if args.manual_functions:
             with open(args.manual_functions, "r", encoding="utf-8") as fh:
                 entries = json.load(fh)
@@ -413,6 +414,7 @@ def main():
             # still needed) -- just rename them so the emitted body is sub_X_gen.
             for addr in wrap & known:
                 translator.func_db[addr]["name"] = f"sub_{addr:08X}_gen"
+                wrapped[addr] = f"sub_{addr:08X}"
 
             # skip - wrap: defined by hand and not wrapped -> declare-only, which
             # is exactly what membership in `manual` produces.
@@ -430,6 +432,7 @@ def main():
             chunk_size=args.split,
             verbose=args.verbose,
             manual=manual,
+            wrapped=wrapped,
         )
 
         t_translate = time.time() - t0

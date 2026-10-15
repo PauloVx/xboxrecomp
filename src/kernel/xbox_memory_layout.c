@@ -14,6 +14,8 @@
 
 #include "xbox_memory_layout.h"
 #include "kernel.h"
+#include "../nv2a/kelvin/kelvin.h"
+#include "../usb/ohci.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -84,6 +86,11 @@ static void *g_tiled_view = NULL;
  * the same numbers for MmClaimGpuInstanceMemory. */
 static void *g_contig_memory = NULL;
 
+/* Low RAM as physical memory: the same section as the low guest addresses,
+ * viewed again right above the contiguous window (see MemoryLayoutInit). */
+#define XBOX_LOWRAM_PHYS_VA  (XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)  /* 0x84000000 */
+static void *g_lowram_phys_view = NULL;
+
 /* NV2A GPU register aperture (see MemoryLayoutInit). Backed as plain RAM so
  * that D3D8 code linked into the title can poke it without faulting. */
 #define XBOX_NV2A_BASE 0xFD000000u
@@ -153,6 +160,17 @@ static size_t xbox_TiledApertureSize(void)
 
 static HANDLE g_nv2a_ack_thread = NULL;
 static volatile LONG g_nv2a_ack_stop = 0;
+
+static int nv2a_ack_stopped(void)
+{
+    /* Shutdown publishes the stop with InterlockedExchange. This is an
+     * acquire poll, not a cached or unsynchronized flag read. */
+#ifdef _MSC_VER
+    return ReadAcquire(&g_nv2a_ack_stop) != 0;
+#else
+    return __atomic_load_n(&g_nv2a_ack_stop, __ATOMIC_ACQUIRE) != 0;
+#endif
+}
 
 /*
  * NV2A busy-bit acknowledgement.
@@ -625,11 +643,12 @@ void xbox_Nv2aFrameCounterFlip(void)
 
 static void frame_counters_tick(void)
 {
-    DWORD now = GetTickCount();
+    DWORD now;
     int i;
 
     if (!g_frame_counter_count)
         return;
+    now = GetTickCount();
     if (g_frame_counter_last_ms
             && (now - g_frame_counter_last_ms) < XBOX_FRAME_PERIOD_MS)
         return;
@@ -720,12 +739,13 @@ static void framebuffer_probe_tick(void)
 {
     static DWORD last_ms;
     static uint32_t last_sum;
-    DWORD now = GetTickCount();
+    DWORD now;
     uint32_t sum = 0, nonzero = 0, i, n;
     const uint32_t *p;
 
     if (!s_nv2a_trace || !s_fb_va || !s_fb_pitch)
         return;
+    now = GetTickCount();
     if (last_ms && (now - last_ms) < 1000)
         return;
     last_ms = now;
@@ -744,13 +764,27 @@ static void framebuffer_probe_tick(void)
     fflush(stderr);
 }
 
+extern void xbox_PinThread(const char *role);
+
+/* Something else that wants a poll on every turn of the acknowledger's loop (the audio DSP's command doorbell, which the
+ * stub DSP can only say is done; polled here the title's spin on it ends in microseconds instead of at the next audio
+ * frame). */
+static void (*volatile g_ack_tick)(void);
+void xbox_SetAckTick(void (*fn)(void)) { g_ack_tick = fn; }
+
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
-    while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+    xbox_PinThread("ACK");
+    while (!nv2a_ack_stopped()) {
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
+            /* With the Kelvin engine running, the interrupt status words are
+             * real registers (kelvin_mmio.c): something does raise GPU
+             * interrupts then, and holding them at zero would lose them. */
+            if (kelvin_owns_register(NV2A_ACK[i].offset))
+                continue;
             if (*r & NV2A_ACK[i].busy_mask) {
                 *r &= ~NV2A_ACK[i].busy_mask;
             }
@@ -762,7 +796,10 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 *r |= NV2A_IDLE[i].idle_mask;
             }
         }
-        {
+        /* With the Kelvin engine running, DMA_GET is its to move: it says
+         * what the GPU has actually consumed. Echoing PUT into it would tell
+         * D3D its ring space was free before the commands in it had run. */
+        if (!kelvin_active()) {
             volatile uint32_t *put =
                 (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
             volatile uint32_t *get =
@@ -770,6 +807,10 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             if (*get != *put) {
                 *get = *put;
             }
+        }
+        {
+            void (*tick)(void) = g_ack_tick;
+            if (tick) tick();
         }
         fence_mirrors_tick();
         counter_mirrors_tick();
@@ -788,7 +829,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          * RECOMP_PB_EXEC asked for it. Gating the call as well meant
          * RECOMP_PB_EXEC on its own did nothing at all, and the executor
          * only ran when someone happened to also be tracing. */
-        {
+        if (!kelvin_active()) {
             /* Is the title submitting GPU work at all? PUT is where the
              * title's pushbuffer writer has got to; if it never moves, nothing
              * is being drawn and the missing piece is upstream of the GPU. */
@@ -848,7 +889,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 fflush(stderr);
             }
         }
-        if (s_nv2a_trace) {
+        if (s_nv2a_trace && !kelvin_owns_register(0x600800)) {
             static uint32_t last_start = 0xFFFFFFFFu;
             uint32_t start = *(volatile uint32_t *)((char *)regs + 0x600800);
             if (start != last_start) {
@@ -1086,6 +1127,7 @@ static uint32_t *s_watchdog_esp;
  * always zero, and read as "every register is null" at exactly the moment the
  * registers are the thing being asked about. */
 static uint32_t *s_watchdog_regs[6];
+static uint16_t *s_watchdog_fp_control;
 static unsigned  s_watchdog_secs;
 
 /* Can RECOMP_PEEK dereference this guest address?
@@ -1110,6 +1152,7 @@ static int peek_readable(uint32_t va)
         { g_nv2a_memory,   XBOX_NV2A_BASE,    XBOX_NV2A_SIZE },
         { g_mcpx_memory,   XBOX_MCPX_BASE,    XBOX_MCPX_SIZE },
         { g_flash_memory,  XBOX_FLASH_BASE,   XBOX_FLASH_SIZE },
+        { g_lowram_phys_view, XBOX_LOWRAM_PHYS_VA, (uint64_t)g_memory_size },
     };
     size_t i;
 
@@ -1154,6 +1197,23 @@ void xbox_PeekSample(const char *label)
     fflush(stderr);
 }
 
+/* What device models add to a hang report: the watchdog calls each before
+ * it exits, so a model can say what state it was left in -- the half of a
+ * hang the guest's registers and stacks cannot show. */
+#define XBOX_MAX_HANG_REPORTS 4
+static void (*g_hang_reports[XBOX_MAX_HANG_REPORTS])(void);
+
+void xbox_AddHangReport(void (*report)(void))
+{
+    int i;
+    for (i = 0; i < XBOX_MAX_HANG_REPORTS; i++) {
+        if (!g_hang_reports[i]) {
+            g_hang_reports[i] = report;
+            return;
+        }
+    }
+}
+
 static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
 {
     const uint8_t *mem;
@@ -1173,6 +1233,8 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
             s_watchdog_regs[3] ? *s_watchdog_regs[3] : 0,
             s_watchdog_regs[4] ? *s_watchdog_regs[4] : 0,
             s_watchdog_regs[5] ? *s_watchdog_regs[5] : 0);
+    fprintf(stderr, "  x87 control word: %04X\n",
+            s_watchdog_fp_control ? *s_watchdog_fp_control : 0);
     /* The recent indirect-call targets name whatever is spinning: a stuck loop
      * inside a function reached through a pointer leaves no clue on the stack
      * beyond the return address of the call that entered it. */
@@ -1228,6 +1290,15 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
         fprintf(stderr, "    GS %08X %08X\n", a,
                 *(const uint32_t *)(mem + a));
     }
+    /* Every guest thread, not only the main one: a main thread waiting on a
+     * worker is only half of a hang. */
+    {
+        extern void xbox_DumpGuestThreads(void);
+        int r;
+        xbox_DumpGuestThreads();
+        for (r = 0; r < XBOX_MAX_HANG_REPORTS && g_hang_reports[r]; r++)
+            g_hang_reports[r]();
+    }
     fflush(stderr);
     _exit(3);
     return 0;
@@ -1251,6 +1322,7 @@ void xbox_WatchdogStart(void)
     s_watchdog_regs[0] = &g_eax; s_watchdog_regs[1] = &g_ecx;
     s_watchdog_regs[2] = &g_edx; s_watchdog_regs[3] = &g_ebx;
     s_watchdog_regs[4] = &g_esi; s_watchdog_regs[5] = &g_edi;
+    s_watchdog_fp_control = &g_fp_control_word;
     h = CreateThread(NULL, 0, xbox_watchdog_thread, NULL, 0, NULL);
     if (h)
         CloseHandle(h);
@@ -1735,6 +1807,9 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         MEM32_INIT(XBOX_FS_BASE + 0x28, FAKE_TLS_VA);
         /* TLS[0x28] = pointer to RW data area */
         MEM32_INIT(FAKE_TLS_VA + 0x28, FAKE_RWDATA_VA);
+        /* The main thread's id (ETHREAD.UniqueThread); see
+         * xbox_AllocThreadObject for the others. */
+        MEM32_INIT(FAKE_TLS_VA + 0x12C, xbox_NewThreadId());
 
         /*
          * XBE TLS directory.
@@ -2017,7 +2092,17 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
     if (g_nv2a_memory) {
         xbox_Nv2aAckStart();
+        /* RECOMP_NV2A_KELVIN: execute the title's pushbuffer on the CPU. */
+        kelvin_start();
     }
+
+    /* RECOMP_USB: the USB host controllers inside the MCPX aperture, which
+     * is how a title's own XAPI reaches its gamepad. */
+    if (g_mcpx_memory)
+        xbox_OhciInit();
+
+    /* RECOMP_WATCH: log who reads or writes a guest range (memory_watch.c). */
+    xbox_MemoryWatchInit();
 
     /*
      * Allocate a page at Xbox kernel address space (0x80010000).
@@ -2124,6 +2209,41 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         fprintf(stderr, "  RAM mirror: %d/%d views mapped (covers %d MB)\n",
                 mirrors_ok, XBOX_NUM_MIRRORS,
                 (int)((mirrors_ok + 1) * g_memory_size / (1024 * 1024)));
+    }
+
+    /*
+     * Low RAM as physical memory, at 0x84000000.
+     *
+     * The low guest addresses (the XBE image, stacks, heap) and the
+     * contiguous window are separate storage here, but a device only ever
+     * sees physical addresses, and both kinds of memory get handed to one:
+     * BLACK's USB stack puts its descriptors in contiguous memory and the
+     * buffer for a device descriptor in its own .data (0x002B2884). With
+     * MmGetPhysicalAddress answering 0x002B2884 for the latter, the OHCI
+     * model wrote the reply into the window at 0x802B2884 and the driver
+     * retried a request that had completed.
+     *
+     * So low RAM gets physical addresses of its own, 64 MB up: a second view
+     * of its section directly above the window, and MmGetPhysicalAddress
+     * (xbox_PhysicalAddressOf) answers low address X with 64 MB + X. Every
+     * device model then resolves any physical address the one way it already
+     * did, as window VA 0x80000000 + P, and reaches the right storage for
+     * both. Retail 64 MB only: a larger RAM would not fit the bank.
+     */
+    if (g_mapping_handle && g_contig_memory
+            && g_memory_size == XBOX_CONTIG_SIZE) {
+        uintptr_t native = XBOX_LOWRAM_PHYS_VA + g_memory_offset;
+        g_lowram_phys_view = MapViewOfFileEx(g_mapping_handle,
+                                             FILE_MAP_ALL_ACCESS, 0, 0,
+                                             g_memory_size, (LPVOID)native);
+        if (g_lowram_phys_view)
+            fprintf(stderr, "  Low RAM as physical 0x%08X+: viewed again at"
+                            " Xbox VA 0x%08X\n",
+                    XBOX_CONTIG_SIZE, XBOX_LOWRAM_PHYS_VA);
+        else
+            fprintf(stderr, "  Low RAM physical view at 0x%08X FAILED (error"
+                            " %lu); its DMA addresses stay ambiguous\n",
+                    XBOX_LOWRAM_PHYS_VA, GetLastError());
     }
 
     /*
@@ -2367,6 +2487,54 @@ ptrdiff_t xbox_GetMemoryOffset(void)
     return g_memory_offset;
 }
 
+/* Physical address 0 as a device sees it: the contiguous window, where
+ * MmGetPhysicalAddress's answers point and where the GPU model resolves its
+ * DMA (KELVIN_PHYS_WINDOW). It is separate storage from the low guest
+ * addresses, so a device model handed xbox_GetMemoryBase() instead reads and
+ * writes somewhere the title never looks. */
+void *xbox_GetPhysicalMemoryBase(void)
+{
+    return g_contig_memory;
+}
+
+/* The device aperture begins with the contiguous arena. Retail low RAM is
+ * mapped immediately after it at its own physical addresses, when that view
+ * was successfully created. A missing view must not be advertised as backing
+ * storage to devices that bounds-check their DMA transfers. */
+size_t xbox_GetPhysicalMemorySize(void)
+{
+    uintptr_t base = (uintptr_t)g_contig_memory;
+    if (!base) return 0;
+    if (base <= UINTPTR_MAX - XBOX_CONTIG_SIZE &&
+        (uintptr_t)g_lowram_phys_view == base + XBOX_CONTIG_SIZE &&
+        g_memory_size <= SIZE_MAX - XBOX_CONTIG_SIZE)
+        return XBOX_CONTIG_SIZE + g_memory_size;
+    return XBOX_CONTIG_SIZE;
+}
+
+/* The physical address a device should be given for guest address va.
+ *
+ *   contiguous window 0x80000000 + P       -> P            (0 .. 64 MB)
+ *   low RAM X, or a wrap mirror of it      -> 64 MB + X    (its own view)
+ *   anything else                          -> va unchanged
+ *
+ * Each answer, added to 0x80000000, is a guest address holding the same
+ * bytes, which is how every device model here resolves a DMA address. */
+uint32_t xbox_PhysicalAddressOf(uint32_t va)
+{
+    if (va >= XBOX_CONTIG_BASE
+            && (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
+        return va - XBOX_CONTIG_BASE;
+    if (g_lowram_phys_view && g_memory_size) {
+        if (va >= XBOX_LOWRAM_PHYS_VA
+                && (uint64_t)va < (uint64_t)XBOX_LOWRAM_PHYS_VA + g_memory_size)
+            return va - XBOX_CONTIG_BASE;
+        if ((uint64_t)va < (uint64_t)g_memory_size * (1 + XBOX_NUM_MIRRORS))
+            return XBOX_CONTIG_SIZE + (uint32_t)(va % g_memory_size);
+    }
+    return va;
+}
+
 /* ── Dynamic heap allocator ────────────────────────────────
  *
  * Simple bump allocator for MmAllocateContiguousMemory and similar.
@@ -2426,8 +2594,17 @@ uint32_t xbox_AllocThreadTib(void)
     const uint32_t tib_size = 0x40;
     uint32_t tib, block, thread_data, total;
 
-    if (!g_tls_total)
-        return 0;                    /* image has no TLS; nothing to copy */
+    /* An image without TLS still needs a TIB of its own per thread: fs:[0x28]
+     * (the current-thread object) differs between threads even when fs:[4]
+     * has nothing to point at. */
+    if (!g_tls_total) {
+        tib = xbox_HeapAlloc(tib_size, 16);
+        if (!tib)
+            return 0;
+        memcpy(TIB_VA(tib), TIB_VA(XBOX_TIB_MAIN), tib_size);
+        *(uint32_t *)TIB_VA(tib + 0x00) = 0xFFFFFFFFu;   /* own SEH chain */
+        return tib;
+    }
 
     total = g_tls_total;
     tib = xbox_HeapAlloc(tib_size + total + g_tls_thread_size, 16);
@@ -2448,6 +2625,53 @@ uint32_t xbox_AllocThreadTib(void)
 
     return tib;
     #undef TIB_VA
+}
+
+/* The current-thread object: what fs:[0x28] points at, the KTHREAD/ETHREAD a
+ * title reaches through PsGetCurrentThread() -- XAPI's GetCurrentThreadId() is
+ * [[fs:[0x28]] + 0x12C], ETHREAD.UniqueThread.
+ *
+ * Every thread used to share the main thread's, whose UniqueThread was 0, so
+ * every thread had id 0 and PsCreateSystemThreadEx reported 0 to the creator
+ * too. BLACK keeps {handle, thread id} for the threads it created and, in
+ * its movie code (0x0020A100), parks whichever thread matches a recorded id:
+ * with every id 0, the main thread matched an unused entry and stopped for
+ * good. Each thread now gets its own copy of the main object with a unique,
+ * non-zero id, stepping by 4 as the kernel's do. */
+#define XBOX_THREAD_OBJ_SIZE        0x200
+#define XBOX_ETHREAD_UNIQUE_THREAD  0x12C
+
+static volatile LONG g_next_thread_id;
+
+uint32_t xbox_NewThreadId(void)
+{
+    return (uint32_t)InterlockedAdd(&g_next_thread_id, 4);
+}
+
+uint32_t xbox_AllocThreadObject(uint32_t id)
+{
+    #define OBJ_VA(va) ((void *)((uintptr_t)(va) + g_memory_offset))
+    uint32_t main_obj = *(uint32_t *)OBJ_VA(XBOX_TIB_MAIN + 0x28);
+    uint32_t obj = xbox_HeapAlloc(XBOX_THREAD_OBJ_SIZE, 16);
+
+    if (!obj)
+        return 0;
+    if (main_obj)
+        memcpy(OBJ_VA(obj), OBJ_VA(main_obj), XBOX_THREAD_OBJ_SIZE);
+    else
+        memset(OBJ_VA(obj), 0, XBOX_THREAD_OBJ_SIZE);
+    *(uint32_t *)OBJ_VA(obj + XBOX_ETHREAD_UNIQUE_THREAD) = id;
+    return obj;
+    #undef OBJ_VA
+}
+
+uint32_t xbox_MainThreadId(void)
+{
+    uint32_t main_obj = *(uint32_t *)((uintptr_t)(XBOX_TIB_MAIN + 0x28)
+                                      + g_memory_offset);
+    return main_obj ? *(uint32_t *)((uintptr_t)(main_obj +
+                                    XBOX_ETHREAD_UNIQUE_THREAD) + g_memory_offset)
+                    : 0;
 }
 
 uint32_t xbox_AllocThreadStack(void)

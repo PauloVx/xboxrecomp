@@ -14,6 +14,7 @@ from capstone import Cs, CS_ARCH_X86, CS_MODE_32, CsInsn
 from capstone import CS_OP_IMM, CS_OP_MEM, CS_OP_REG
 
 from . import config
+from .jump_tables import CodeView, JumpTableSpan, proven_index_span
 from .loader import BinaryImage, SectionInfo
 
 
@@ -37,7 +38,10 @@ class Instruction:
     call_target: Optional[int] = None     # For direct calls
     jump_target: Optional[int] = None     # For direct jumps
     memory_ref: Optional[int] = None      # For [addr] references
-    jump_table: Optional[int] = None      # For `jmp [reg*4 + table]`
+    # For `jmp [reg*4 + table]`: the operand displacement, which is also
+    # where the table starts for an ordinary switch. resync_jump_tables()
+    # moves it to the real table start when the index is proven negative.
+    jump_table: Optional[int] = None
     imm_ref: Optional[int] = None         # For `push offset x` / `mov reg, offset x`
 
     @property
@@ -95,6 +99,8 @@ class DisasmEngine:
         # recorded during the sweep.
         self.jump_tables: Dict[int, int] = {}
         self._jt_candidates: Set[int] = set()
+        # Operand displacement -> addresses of the jumps that index it.
+        self._jt_dispatchers: Dict[int, Set[int]] = {}
 
     def _classify_instruction(self, cs_insn: CsInsn) -> Instruction:
         """Convert a Capstone instruction to our Instruction type."""
@@ -144,6 +150,8 @@ class DisasmEngine:
                             self.image.base_address + self.image.image_size):
                         insn.jump_table = disp
                         self._jt_candidates.add(disp)
+                        self._jt_dispatchers.setdefault(
+                            disp, set()).add(insn.address)
 
             # Check for memory references in non-branch instructions
             if not (insn.is_call or insn.is_branch) and insn.memory_ref is None:
@@ -253,10 +261,28 @@ class DisasmEngine:
         real code back up. A table entry must point into an executable section
         for the table to keep growing, which is what bounds it.
 
+        A dispatch whose index is proven to go negative, or to skip the slot
+        at its displacement (see jump_tables.py), reads a table that does not
+        start there. Those are measured first, from what bounds the index,
+        and their displacement is then not scanned forward as a table of its
+        own.
+
         Returns the number of tables resynced.
         """
         resynced = 0
+        handled: Set[int] = set()
+        for span in self._proven_index_spans():
+            self._mark_table(span.start, span.end)
+            dispatch = self.instructions.get(span.dispatch)
+            if dispatch is not None:
+                dispatch.jump_table = span.start
+            handled.add(span.dispatch)
+            resynced += 1
+
         for tbl in sorted(self._jt_candidates):
+            users = self._jt_dispatchers.get(tbl)
+            if users and users <= handled:
+                continue
             # XBEs mark .rdata and .data executable, so "points at an
             # executable section" alone would let an array of data pointers
             # pass as a jump table -- and resyncing over real instructions is
@@ -279,18 +305,63 @@ class DisasmEngine:
                 # would delete real instructions.
                 continue
 
-            end = tbl + entries * 4
-            for insn in self.get_instructions_in_range(
-                    tbl - 16, end):
-                if insn.end_address > tbl and insn.address < end:
-                    del self.instructions[insn.address]
-            self._sorted_addrs = None
-
-            self.jump_tables[tbl] = end
-            self.decode_at(end)
+            self._mark_table(tbl, tbl + entries * 4)
             resynced += 1
 
         return resynced
+
+    def _mark_table(self, tbl: int, end: int) -> None:
+        """Record [tbl, end) as table data and decode the code after it."""
+        for insn in self.get_instructions_in_range(tbl - 16, end):
+            if insn.end_address > tbl and insn.address < end:
+                del self.instructions[insn.address]
+        self._sorted_addrs = None
+
+        self.jump_tables[tbl] = end
+        self.decode_at(end)
+
+    def _proven_index_spans(self) -> List[JumpTableSpan]:
+        """Tables whose extent comes from a proven index range.
+
+        MSVC's CRT memmove indexes its unwind table with a negated dword
+        count (`neg ecx; jmp [ecx*4 + table+28]`), so the displacement is the
+        table's last entry and the forward scan above finds one entry of
+        eight. BLACK's memmove at 0x000A24E0 lost 0x000A2784 that way. Its
+        lead-byte tables go the other way (`and eax, 3; jmp [eax*4 +
+        LeadUpVec-4]`): the displacement slot is instruction bytes, and the
+        forward scan finds nothing.
+
+        Held to the same standard as a forward table, and higher: the table
+        must sit in its dispatch's own section, and every slot left in it must
+        hold a pointer into that section. A hole means the proof and the bytes
+        disagree, and resyncing over real instructions is worse than missing
+        a table.
+        """
+        dispatchers = []
+        for addrs in self._jt_dispatchers.values():
+            for addr in addrs:
+                insn = self.instructions.get(addr)
+                if insn is not None and insn.jump_table is not None:
+                    dispatchers.append(insn)
+        if not dispatchers:
+            return []
+
+        view = CodeView(self.instructions.values())
+        spans = []
+        for insn in sorted(dispatchers, key=lambda i: i.address):
+            home = self.image.get_section_at_va(insn.address)
+            if home is None:
+                continue
+            lo = home.virtual_addr
+            hi = lo + home.virtual_size
+            span = proven_index_span(view, insn, self.image.read_u32_at_va,
+                                     lambda value: lo <= value < hi)
+            if span is None or len(span.slots) < 2:
+                continue
+            if not (lo <= span.start and span.end <= hi):
+                continue
+            spans.append(span)
+        return spans
 
     def jump_table_entries(self, tbl: int) -> List[int]:
         """Code pointers held by a resynced jump table, or [] if unknown."""
@@ -424,9 +495,23 @@ class DisasmEngine:
 
         limit = addr + len(data)
         count = 0
+        has_frame = False
         for decoded in self._cs.disasm(data, addr):
             count += 1
             mnemonic = decoded.mnemonic.lower()
+            # `leave` only makes sense after a frame pointer has been set up.
+            # Executable sections can contain embedded tables; arbitrary bytes
+            # there often decode through `leave` and then into a `ret`.
+            if mnemonic == "push" and decoded.op_str.lower() == "ebp":
+                next_insn = self._cs.disasm(data[decoded.address - addr + decoded.size:],
+                                            decoded.address + decoded.size,
+                                            count=1)
+                next_insn = next(next_insn, None)
+                if (next_insn is not None and next_insn.mnemonic.lower() == "mov"
+                        and next_insn.op_str.lower() == "ebp, esp"):
+                    has_frame = True
+            if mnemonic == "leave" and not has_frame:
+                return False
             if mnemonic in config.RET_MNEMONICS:
                 return True
             if mnemonic in config.JMP_MNEMONICS:
@@ -558,7 +643,28 @@ class DisasmEngine:
         if m == "sub" and ops.startswith("esp,"):
             return True
         if m == "mov" and ops.replace(" ", "") == "edi,edi":
-            return True   # hot-patch pad
+            # The two-byte hot-patch pad is not a prologue by itself. It also
+            # occurs immediately before inline jump tables (BLACK has two such
+            # gaps), where treating it as a function start decodes table bytes
+            # as code and invents unresolved call targets. Require the bytes
+            # after the pad to have a real MSVC entry shape.
+            after = list(self._cs.disasm(
+                data[offset + first.size:offset + first.size + 16],
+                addr + first.size, count=2))
+            if not after:
+                return False
+            nxt = after[0]
+            if nxt.mnemonic == "push" and nxt.op_str == "ebp":
+                return (len(after) > 1
+                        and after[1].mnemonic in ("mov", "lea")
+                        and after[1].op_str.replace(" ", "").startswith(
+                            "ebp,"))
+            if nxt.mnemonic == "push" and nxt.op_str in (
+                    "esi", "edi", "ebx"):
+                return True
+            if nxt.mnemonic == "sub" and nxt.op_str.startswith("esp,"):
+                return True
+            return False
 
         # A function whose frame __SEH_prolog builds:
         #

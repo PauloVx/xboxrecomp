@@ -8,6 +8,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* The standalone test has no kernel acknowledgement loop. The production
+ * frame entry point also calls the DSP acknowledgement directly. */
+void xbox_SetAckTick(void (*fn)(void))
+{
+    (void)fn;
+}
+
 /* The bins a title's 3D positional voices actually land in, from JSRF's own
  * V0BIN..V3BIN. 6 and 8 are even (left), 7 and 9 odd (right), so a mixdown
  * that preserves the guest's stereo pairing puts signal on both channels. */

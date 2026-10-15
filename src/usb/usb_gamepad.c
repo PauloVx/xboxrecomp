@@ -189,8 +189,178 @@ int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max)
 /* ---- the input report -------------------------------------------------- */
 
 /* The host's own pad, through the layer that already maps one to XInput.
- * A real controller plugged into the PC drives this emulated one. */
+ * A real controller plugged into the PC drives this emulated one. The keyboard and mouse join
+ * the same report (pc_input.c), so the game sees one pad whichever device is in use. */
 #include "../input/xinput_xbox.h"
+#include "../input/pc_input.h"
+
+/* ---- scripted input ----------------------------------------------------- */
+
+/*
+ * RECOMP_PAD_SCRIPT: presses the pad makes on its own, on top of whatever the
+ * host pad reports, so a run can get past a movie or through a menu the same
+ * way every time. A comma-separated list of
+ *
+ *     ms:BUTTON[+BUTTON...][/hold_ms][*period_ms]
+ *
+ * where ms counts from the title's first read of the pad, a press is held for
+ * hold_ms (default 200) and, with *period_ms, repeats that often. Buttons:
+ * A B X Y BLACK WHITE LT RT (the analog ones) and UP DOWN LEFT RIGHT START
+ * BACK LTHUMB RTHUMB. The sticks, pushed all the way: LS_UP LS_DOWN LS_LEFT
+ * LS_RIGHT, and RS_ the same. Example: "15000:START,17000:A,19000:DOWN,20000:A";
+ * "60000:LS_UP+RS_RIGHT/2000" walks forward turning right for two seconds.
+ * Each press is logged when it starts.
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+
+typedef struct PadPress {
+    uint32_t start_ms, hold_ms, period_ms;
+    uint16_t digital;            /* wButtons bits                        */
+    uint8_t analog;              /* bit i = bAnalogButtons[i] fully down */
+    uint8_t sticks;              /* bit 2*axis, +1 if negative: pushed   */
+    uint32_t logged;             /* last repeat index announced          */
+} PadPress;
+
+#define PAD_SCRIPT_MAX 128
+static PadPress s_script[PAD_SCRIPT_MAX];
+static int s_script_n = -1;
+static uint64_t s_script_t0;
+
+static uint64_t pad_now_ms(void)
+{
+#if defined(_WIN32)
+    return GetTickCount64();
+#else
+    return 0;
+#endif
+}
+
+static int pad_button(const char *name, size_t n, PadPress *p)
+{
+    /* Axes in report order -- LX LY RX RY -- with +X right and +Y up. */
+    static const struct {
+        const char *name; uint16_t digital; int analog, stick;
+    } map[] = {
+        { "UP", 0x01, -1, -1 }, { "DOWN", 0x02, -1, -1 },
+        { "LEFT", 0x04, -1, -1 }, { "RIGHT", 0x08, -1, -1 },
+        { "START", 0x10, -1, -1 }, { "BACK", 0x20, -1, -1 },
+        { "LTHUMB", 0x40, -1, -1 }, { "RTHUMB", 0x80, -1, -1 },
+        { "A", 0, 0, -1 }, { "B", 0, 1, -1 }, { "X", 0, 2, -1 },
+        { "Y", 0, 3, -1 }, { "BLACK", 0, 4, -1 }, { "WHITE", 0, 5, -1 },
+        { "LT", 0, 6, -1 }, { "RT", 0, 7, -1 },
+        { "LS_RIGHT", 0, -1, 0 }, { "LS_LEFT", 0, -1, 1 },
+        { "LS_UP", 0, -1, 2 }, { "LS_DOWN", 0, -1, 3 },
+        { "RS_RIGHT", 0, -1, 4 }, { "RS_LEFT", 0, -1, 5 },
+        { "RS_UP", 0, -1, 6 }, { "RS_DOWN", 0, -1, 7 },
+    };
+    size_t i;
+
+    for (i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
+        if (strlen(map[i].name) == n && !_strnicmp(map[i].name, name, n)) {
+            if (map[i].stick >= 0)
+                p->sticks |= (uint8_t)(1u << map[i].stick);
+            else if (map[i].analog >= 0)
+                p->analog |= (uint8_t)(1u << map[i].analog);
+            else
+                p->digital |= map[i].digital;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void pad_script_load(void)
+{
+    const char *e = getenv("RECOMP_PAD_SCRIPT");
+
+    s_script_n = 0;
+    while (e && *e && s_script_n < PAD_SCRIPT_MAX) {
+        PadPress *p = &s_script[s_script_n];
+        char *end;
+        const char *q;
+
+        memset(p, 0, sizeof(*p));
+        p->hold_ms = 200;
+        p->logged = ~0u;
+        p->start_ms = (uint32_t)strtoul(e, &end, 10);
+        if (*end != ':')
+            break;
+        q = end + 1;
+        for (;;) {
+            size_t n = strcspn(q, "+/*,");
+            if (!pad_button(q, n, p)) {
+                fprintf(stderr, "  [PAD] RECOMP_PAD_SCRIPT: unknown button"
+                                " '%.*s'\n", (int)n, q);
+            }
+            q += n;
+            if (*q != '+')
+                break;
+            q++;
+        }
+        if (*q == '/')
+            p->hold_ms = (uint32_t)strtoul(q + 1, (char **)&q, 10);
+        if (*q == '*')
+            p->period_ms = (uint32_t)strtoul(q + 1, (char **)&q, 10);
+        s_script_n++;
+        e = (*q == ',') ? q + 1 : NULL;
+    }
+    if (s_script_n)
+        fprintf(stderr, "  [PAD] %d scripted press(es) from RECOMP_PAD_SCRIPT\n",
+                s_script_n);
+}
+
+/* Presses due now, merged into the report being built. */
+static void pad_script_apply(uint8_t *out)
+{
+    uint64_t t;
+    int i;
+
+    if (s_script_n < 0)
+        pad_script_load();
+    if (!s_script_n)
+        return;
+    if (!s_script_t0)
+        s_script_t0 = pad_now_ms();
+    t = pad_now_ms() - s_script_t0;
+    for (i = 0; i < s_script_n; i++) {
+        PadPress *p = &s_script[i];
+        uint64_t since, k;
+        int b;
+
+        if (t < p->start_ms)
+            continue;
+        since = t - p->start_ms;
+        k = p->period_ms ? since / p->period_ms : 0;
+        if (p->period_ms)
+            since %= p->period_ms;
+        else if (since >= p->hold_ms)
+            continue;
+        if (since >= p->hold_ms)
+            continue;
+        if (p->logged != (uint32_t)k) {
+            p->logged = (uint32_t)k;
+            fprintf(stderr, "  [PAD] t=%llu ms: press %d (digital %02X analog"
+                            " %02X sticks %02X)\n", (unsigned long long)t, i,
+                    p->digital, p->analog, p->sticks);
+            fflush(stderr);
+        }
+        out[2] |= (uint8_t)p->digital;
+        for (b = 0; b < 8; b++)
+            if (p->analog & (1u << b))
+                out[4 + b] = 0xFF;
+        for (b = 0; b < 8; b++) {
+            if (p->sticks & (1u << b)) {
+                uint16_t v = (b & 1) ? 0x8000u : 0x7FFFu;   /* -32768 : 32767 */
+                out[12 + (b >> 1) * 2] = (uint8_t)(v & 0xFF);
+                out[13 + (b >> 1) * 2] = (uint8_t)(v >> 8);
+            }
+        }
+    }
+}
 
 /*
  * The Xbox report is 20 bytes and fixed:
@@ -215,9 +385,15 @@ int usb_gamepad_report(uint8_t *out, int max)
     out[1] = 20;
 
     /* A disconnected host pad is not an error here: the device is present on
-     * the bus either way, it just reports nothing pressed. */
-    if (xbox_InputGetState(0, &state) != 0)
+     * the bus either way, it just reports nothing pressed -- apart from
+     * anything scripted and whatever the keyboard and mouse are doing. */
+    if (xbox_InputGetState(0, &state) != 0) {
+        pad_script_apply(out);
+        /* A configured script stands in for a connected controller, including mode filtering
+         * and activity-driven prompts; it must enter the same merge as real XInput. */
+        pc_input_apply_report(out, s_script_n > 0);
         return 20;
+    }
 
     g = &state.Gamepad;
     out[2] = (uint8_t)(g->wButtons & 0xFF);
@@ -232,5 +408,7 @@ int usb_gamepad_report(uint8_t *out, int max)
     out[17] = (uint8_t)((g->sThumbRX >> 8) & 0xFF);
     out[18] = (uint8_t)(g->sThumbRY & 0xFF);
     out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
+    pad_script_apply(out);
+    pc_input_apply_report(out, 1);
     return 20;
 }

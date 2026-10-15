@@ -211,6 +211,30 @@ void *xbox_GetMemoryBase(void);
  * Returns 0 if memory is mapped at original Xbox addresses (ideal case).
  */
 ptrdiff_t xbox_GetMemoryOffset(void);
+
+/**
+ * Host pointer for physical address 0 as devices see it -- the contiguous
+ * window at XBOX_CONTIG_BASE, which MmGetPhysicalAddress maps into. Device
+ * models that follow DMA addresses (APU voices, buffers, notifiers) resolve
+ * them here. NULL if that window is not mapped.
+ */
+void *xbox_GetPhysicalMemoryBase(void);
+
+/**
+ * Bytes of mapped backing reachable from xbox_GetPhysicalMemoryBase().
+ * Includes the low-RAM physical view only when it is mapped immediately
+ * after the contiguous arena. Returns 0 if the arena is not mapped.
+ */
+size_t xbox_GetPhysicalMemorySize(void);
+
+/**
+ * The physical address a device should be given for a guest address: the
+ * contiguous window maps to 0..64 MB, low RAM (and its mirrors) to its own
+ * view at 64 MB + X. Adding 0x80000000 to the answer gives a guest address
+ * holding the same bytes. MmGetPhysicalAddress answers with this.
+ */
+uint32_t xbox_PhysicalAddressOf(uint32_t va);
+
 /* Bytes of guest address space mapped, for bounds-checking a guest pointer
  * that came out of guest memory rather than from this side. */
 size_t xbox_GetMappedSize(void);
@@ -312,12 +336,14 @@ typedef union RecompMmx {
 
 #ifndef RECOMP_XMM_DEFINED
 #define RECOMP_XMM_DEFINED
+#include <emmintrin.h>
 typedef union RecompXmm {
     float    f[4];
     double   d[2];
     uint32_t u[4];
     int32_t  i[4];
     uint64_t q[2];
+    __m128   m;
 } RecompXmm;
 #endif
 
@@ -441,6 +467,20 @@ extern RECOMP_TLS uint32_t g_fs_base;
  * Thread-safe: no (single-threaded recompiled code).
  */
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
+
+/* RECOMP_WATCH=<addr>[,<bytes>]: log each access to a guest range with the
+ * function making it (memory_watch.c). Called once the memory is mapped. */
+void xbox_MemoryWatchInit(void);
+
+/* A device model's addition to the watchdog's hang report (at most 4). */
+void xbox_AddHangReport(void (*report)(void));
+/* A device model's own host thread, sampled in the hang report (at most 8). */
+void xbox_AddHangThread(unsigned long tid, const char *name);
+
+/* Per-thread current-thread objects (fs:[0x28]) and their unique ids. */
+uint32_t xbox_NewThreadId(void);
+uint32_t xbox_AllocThreadObject(uint32_t id);
+uint32_t xbox_MainThreadId(void);
 
 /**
  * Free a block from the Xbox heap. Currently a no-op (bump allocator).

@@ -15,6 +15,7 @@ import bisect
 import json
 import glob
 import os
+import re
 import struct
 
 # Import the functions, not the VA constants: configure_from_xbe() rebinds those
@@ -22,9 +23,19 @@ import struct
 from .config import va_to_file_offset, is_code_address
 from . import config as _config
 from .disasm import Disassembler
+from tools.disasm.jump_tables import CodeView, proven_index_span
 from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
                      _RESULT_SNAPSHOT_SETTERS,
                      detect_setjmp_helpers, _func_ident, _operand_width)
+
+
+def _render_unresolved_stub(addr, name, popped):
+    """Emit a diagnostic hook before the stub consumes the guest return."""
+    stack_pop = 4 + popped
+    note = f"ret {popped}" if popped else "not detected"
+    return (f"void {name}(void) {{ "
+            f"RECOMP_UNRESOLVED_STUB_HIT(0x{addr:08X}u); "
+            f"g_esp += {stack_pop}; /* 0x{addr:08X}: {note} */ }}")
 
 
 def _merge_flag_states(states):
@@ -48,7 +59,22 @@ def _merge_flag_states(states):
             if (_operand_width(ops[0]) or _operand_width(ops[1])) != width:
                 return None
         return first
+    # Float compares snapshot too: (u)comiss/(u)comisd into _fca/_fcb, the x87
+    # compare-to-EFLAGS forms into g_fp_cmp, and the condition a jcc builds
+    # reads the snapshot, not the operands. So a join of compares from one
+    # family can use whichever ran. Without this BLACK's front-end direction
+    # test (0x001F51A4: `comiss` on both edges, then `jbe`) fell back to the
+    # never-assigned _flags, reported a stick pushed on every frame, and its
+    # event hid every START press.
+    for family in (_SSE_COMPARES, _X87_COMPARES):
+        if all(state[0] in family for state in states):
+            return first
     return _merge_zero_flag(states)
+
+
+_SSE_COMPARES = frozenset(("comiss", "ucomiss", "comisd", "ucomisd"))
+_X87_COMPARES = frozenset(("fcomi", "fcomip", "fcompi", "fucomi", "fucomip",
+                           "fucompi"))
 
 
 def _merge_zero_flag(states):
@@ -310,19 +336,41 @@ class FunctionTranslator:
         self.recovered_function_starts = set()
         self._recovered_cfg = {}
         self._ownership_ready = False
+        # Immediate operands of detected functions' instructions: value -> the
+        # first instruction naming it. Filled by _decode_detected_functions.
+        self.code_immediates = None
+
+    def _decode_detected_functions(self):
+        """Yield (start, instructions) for every detected function.
+
+        Decoding them all takes BLACK 13 s, so the one pass also notes each
+        instruction's immediates in code_immediates for
+        discover_pointed_gap_functions.
+        """
+        immediates = {}
+        for start, func_info in list(self.func_db.items()):
+            end = func_info.get("end", start)
+            raw_bytes = self._read_func_bytes(start, end)
+            if not raw_bytes:
+                continue
+            instructions = self.disasm.disassemble_function(
+                raw_bytes, start, end)
+            for insn in instructions:
+                if insn.is_call or insn.is_branch:
+                    continue              # its operand is an edge, not data
+                for op in insn.operands:
+                    if op.type == "imm" and op.imm is not None:
+                        immediates.setdefault(op.imm & 0xFFFFFFFF,
+                                              insn.address)
+            yield start, instructions
+        self.code_immediates = immediates
 
     def discover_static_indirect_targets(self):
         """Recover function entries from bounded static callback tables."""
         original_starts = sorted(self.func_db)
         recovered_callers = {}
 
-        for caller, func_info in list(self.func_db.items()):
-            end = func_info.get("end", caller)
-            raw_bytes = self._read_func_bytes(caller, end)
-            if not raw_bytes:
-                continue
-            instructions = self.disasm.disassemble_function(
-                raw_bytes, caller, end)
+        for caller, instructions in self._decode_detected_functions():
             for lower, upper in self._find_static_indirect_ranges(instructions):
                 targets = self._read_static_callback_table(
                     lower, upper, original_starts)
@@ -370,6 +418,208 @@ class FunctionTranslator:
             self.recovered_function_starts.add(target)
 
         return self.recovered_function_starts
+
+    # Instructions compiled title code does not contain. Data decoded as code
+    # produces them readily (a table of floats makes `mov eax, cr1` without
+    # trying), so reaching one is the tell that a region is not a function.
+    _SYSTEM_MNEMONICS = frozenset({
+        "hlt", "in", "out", "insb", "insw", "insd", "outsb", "outsw", "outsd",
+        "lgdt", "lidt", "lldt", "ltr", "sgdt", "sidt", "sldt", "str", "lmsw",
+        "smsw", "clts", "invd", "wbinvd", "invlpg", "rdmsr", "wrmsr", "iret",
+        "iretd", "retf", "lcall", "ljmp", "arpl", "bound", "aam", "aad", "daa",
+        "das", "aaa", "aas", "salc", "into", "int", "int1", "lds", "les",
+        "lss", "lfs", "lgs", "icebp", "ud2",
+    })
+    _SYSTEM_REGISTER_RE = re.compile(r"\b[cdt]r\d\b")
+
+    def plausible_code_end(self, start, limit):
+        """End of the code reachable from start, or None if it is not code.
+
+        Follows control flow from start, bounded by limit, and accepts the
+        region only if some path leaves it, nothing reachable is an instruction
+        compiled code never contains, and no path runs into bytes that do not
+        decode. The answer is where the reachable code ends -- not `limit` --
+        so data after a function's last instruction is not translated with it.
+        """
+        raw = self._read_func_bytes(start, limit)
+        if not raw or raw[0] in (0xCC, 0x90, 0x00):
+            return None
+        insns = self.disasm.disassemble_cfg(raw, start, limit, {start})
+        if not insns:
+            return None
+        # It has to leave somehow: a ret, a tail jump to a detected function,
+        # or running on into one (the detector split a function in two at a
+        # start it saw, as with 0x0011FC60 continuing into 0x00120000).
+        leaves = any(
+            insn.is_ret
+            or (insn.is_jump and insn.jump_target in self.func_db)
+            or (not insn.is_terminator and insn.end_address == limit
+                and limit in self.func_db)
+            for insn in insns)
+        if not leaves:
+            return None
+        decoded = {insn.address for insn in insns}
+        for insn in insns:
+            if insn.mnemonic in self._SYSTEM_MNEMONICS:
+                return None
+            if self._SYSTEM_REGISTER_RE.search(insn.op_str):
+                return None
+            if (not insn.is_terminator and insn.end_address < limit
+                    and insn.end_address not in decoded):
+                return None             # decoding stopped: invalid bytes
+        return max(insn.end_address for insn in insns)
+
+    # What MSVC emits as padding: int3/nop runs, and the lea/mov forms it uses
+    # to align a jump table after a function's last instruction.
+    _PAD_SEQUENCES = (
+        bytes.fromhex("8da42400000000"),    # lea esp, [esp]
+        bytes.fromhex("8d9b00000000"),      # lea ebx, [ebx]
+        bytes.fromhex("8d642400"),          # lea esp, [esp]
+        bytes.fromhex("8d4900"),            # lea ecx, [ecx]
+        bytes.fromhex("8d4000"),            # lea eax, [eax]
+        bytes.fromhex("8bff"),              # mov edi, edi
+    )
+
+    def _gap_is_function_tail(self, prev_start, prev_end, target):
+        """Does [prev_end, target) hold only what MSVC leaves after a function?
+
+        That is alignment padding, the function's switch jump tables (aligned
+        dwords pointing back into it), the byte index tables of two-level
+        switches, and padding again. BLACK's game functions reached only
+        through vtables sit right after such tables (0x0011C1A0 follows
+        `lea ecx, [ecx]` and five entries into 0x0011C0A0's body).
+        """
+        data = self._read_func_bytes(prev_end, target)
+        if data is None or len(data) != target - prev_end:
+            return False
+        i, n = 0, len(data)
+        seen_table = False
+
+        def skip_padding(i):
+            while i < n:
+                if data[i] in (0xCC, 0x90):
+                    i += 1
+                    continue
+                for seq in self._PAD_SEQUENCES:
+                    if data.startswith(seq, i):
+                        i += len(seq)
+                        break
+                else:
+                    break
+            return i
+
+        i = skip_padding(i)
+        while i + 4 <= n and (prev_end + i) % 4 == 0:
+            value = struct.unpack_from("<I", data, i)[0]
+            if not prev_start <= value < prev_end:
+                break
+            seen_table = True
+            i += 4
+        if seen_table:
+            # a two-level switch's index table: small case numbers
+            while i < n and data[i] < 0x40:
+                i += 1
+        i = skip_padding(i)
+        return i == n
+
+    def discover_pointed_gap_functions(self):
+        """Recover functions only a pointer in the image leads to.
+
+        An aligned dword anywhere in the image, or an immediate of a detected
+        function's instruction, whose value lands in a gap between detected
+        functions -- not a start, not inside one -- and whose bytes decode to
+        code ending in a ret is a function the detector missed: nothing calls
+        it directly, so only data names it. XAPI's USB class-driver table at
+        the head of BLACK's XPP section (0x0027D000) is one: it points at
+        0x0027EDFC, which is called through it once a pad is configured, and
+        without a translation that call went nowhere. BLACK's 0x001D6EF0 is
+        another, named only by `push 0x001D6EF0` at 0x001EDF4A -- an
+        immediate, aligned to nothing -- and called while a level loads.
+
+        Only a value right where the previous function ends -- with nothing
+        between but what MSVC leaves after a function (_gap_is_function_tail)
+        -- counts, and the region has to pass plausible_code_end. Code sections here also hold data (XMV's
+        constant tables, jump tables after their functions), and values
+        pointing into those are tables pointing at tables.
+        """
+        starts = sorted(self.func_db)
+        ends = {}
+        for start in starts:
+            info = self.func_db[start]
+            ends[start] = info.get("end") or (start + info.get("size", 0))
+        found = {}
+        code = [s for s in _config.sections() if s.is_code]
+        if not code:
+            return 0
+        lo = min(s.va for s in code)
+        hi = max(s.va + s.va_size for s in code)
+
+        def consider(value, ref):
+            if value in self.func_db or value in found:
+                return
+            if not _config.is_code_address(value):
+                return
+            i = bisect.bisect_right(starts, value)
+            if i == 0 or i >= len(starts):
+                return
+            prev_start = starts[i - 1]
+            prev_end = ends[prev_start]
+            if prev_end > value:
+                return                        # inside a detected function
+            if value - prev_end > 4096:
+                return                        # not right after a function
+            if not self._gap_is_function_tail(prev_start, prev_end, value):
+                return                        # data other than its tail
+            found[value] = (starts[i], ref)
+
+        for section in _config.sections():
+            if not section.raw_size:
+                continue
+            data = self.xbe_data[section.raw_addr:
+                                 section.raw_addr + section.raw_size]
+            for off in range(0, len(data) - 3, 4):
+                value = struct.unpack_from("<I", data, off)[0]
+                if lo <= value < hi:
+                    consider(value, section.va + off)
+
+        # Immediates of decoded instructions, not every byte offset of code:
+        # that reads opcodes as pointers, and on BLACK it recovered 95
+        # "functions" of junk, some calling into kernel space.
+        if self.code_immediates is None:
+            for _ in self._decode_detected_functions():
+                pass
+        for value, ref in sorted(self.code_immediates.items()):
+            if lo <= value < hi:
+                consider(value, ref)
+
+        added = 0
+        for target, (next_start, ref) in sorted(found.items()):
+            end = self.plausible_code_end(target, next_start)
+            if end is None:
+                continue
+            raw_bytes = self._read_func_bytes(target, end)
+            instructions = self.disasm.disassemble_function(
+                raw_bytes, target, end) if raw_bytes else []
+            section = next((s.name for s in _config.sections()
+                            if s.va <= target < s.va + s.va_size), "")
+            self.func_db[target] = {
+                "_addr": target,
+                "start": f"0x{target:08X}",
+                "end": end,
+                "size": end - target,
+                "name": self.label_db.get(target, f"sub_{target:08X}"),
+                "section": section,
+                "confidence": 0.8,
+                "detection_method": "data_pointer_gap",
+                "num_instructions": len(instructions),
+                "has_prologue": self._func_has_prologue(instructions),
+                "calls_to": [],
+                "called_by": [],
+                "pointed_from": f"0x{ref:08X}",
+            }
+            self.recovered_function_starts.add(target)
+            added += 1
+        return added
 
     @staticmethod
     def _find_static_indirect_ranges(instructions, max_bytes=0x10000):
@@ -551,6 +801,36 @@ class FunctionTranslator:
                     cfg_targets.update(targets)
                 return instructions, jump_tables, cfg_targets
 
+    def undetected_entry_end(self, addr, starts):
+        """Where a function entered at an undetected address `addr` ends.
+
+        Inside a detected function it runs to that function's end: a jump
+        into another function's tail (MSVC's CRT shares tails this way) or a
+        call to a secondary entry executes the rest of that body. Between
+        functions -- code only a thunk's `jmp` reaches, like BLACK's
+        XInitDevices body behind `jmp 0x0027D058` -- it runs to the next
+        detected start, if plausible_code_end accepts it, and only as far as
+        its code reaches. None if addr is not code.
+
+        starts: sorted detected function starts.
+        """
+        limit = _config.code_bytes_end(addr)
+        if limit is None:
+            return None
+        i = bisect.bisect_right(starts, addr) - 1
+        if i >= 0 and starts[i] != addr:
+            start = starts[i]
+            info = self.func_db.get(start, {})
+            recovered = self._recovered_cfg.get(start)
+            end = (recovered["end"] if recovered else info.get("end")) or (
+                start + info.get("size", 0))
+            if start < addr < end:
+                return min(end, limit)
+        # Between functions: only code, and only as far as it reaches.
+        if i + 1 < len(starts) and starts[i + 1] > addr:
+            limit = min(starts[i + 1], limit)
+        return self.plausible_code_end(addr, limit)
+
     def _stub_ret_bytes(self, addr, max_insns=48):
         """Bytes the code at `addr` would have popped beyond the return address.
 
@@ -609,6 +889,39 @@ class FunctionTranslator:
             return []
         backward.reverse()
         return backward + forward
+
+    def _read_u32(self, va):
+        offset = va_to_file_offset(va)
+        if offset is None or offset + 4 > len(self.xbe_data):
+            return None
+        return struct.unpack_from('<I', self.xbe_data, offset)[0]
+
+    def _proven_index_tables(self, instructions, start, end):
+        """Displacement -> in-function targets for proven-index dispatches.
+
+        BLACK's memmove dispatches `neg ecx; jmp [ecx*4 + 0x000A2778]` after
+        `cmp ecx, 8; jb`, so the table is the eight dwords ending at the
+        displacement. Read forward it has one entry, the lifter emitted
+        RECOMP_ITAIL for the whole switch, and the runtime could not resolve
+        the internal label 0x000A2784 it then jumped to. Its lead-byte copies
+        (`and eax, 3; jmp [eax*4 + 0x000A2540]`) never use the slot at the
+        displacement, which holds instruction bytes, so a forward read found
+        no table at all.
+        """
+        dispatches = [insn for insn in instructions
+                      if insn.is_jump and insn.jump_target is None
+                      and insn.operands and insn.operands[0].type == "mem"
+                      and insn.operands[0].mem_index]
+        if not dispatches:
+            return {}
+        view = CodeView(instructions)
+        tables = {}
+        for insn in dispatches:
+            span = proven_index_span(view, insn, self._read_u32,
+                                     lambda va: start <= va < end)
+            if span is not None and len(span.slots) >= 2:
+                tables[span.disp] = span.targets
+        return tables
 
     def _read_func_bytes(self, start_va, end_va):
         """Read raw bytes for a function from the XBE."""
@@ -711,14 +1024,23 @@ class FunctionTranslator:
         # Set function bounds for the lifter
         self.lifter.func_start = start
         self.lifter.func_end = end
-        self.lifter.jump_table_targets = (
-            recovered["jump_tables"] if recovered else {})
+        jump_tables = dict(recovered["jump_tables"]) if recovered else {}
+        self.lifter.jump_table_targets = jump_tables
 
         # Disassemble
         instructions = (recovered["instructions"] if recovered else
                         self.disasm.disassemble_function(raw_bytes, start, end))
         if not instructions:
             return [], []
+
+        # The lifter reads a switch table forward from the jump's
+        # displacement. When the index is proven negative the table ends
+        # there instead, and when it provably skips the displacement slot
+        # the table starts after it; hand the lifter the real entries, keyed
+        # the way it looks them up. See tools/disasm/jump_tables.py.
+        for disp, targets in self._proven_index_tables(
+                instructions, start, end).items():
+            jump_tables.setdefault(disp, targets)
 
         # Addresses this function loads as immediates into a register and
         # then jumps to. `mov ebx, 0x3A0DC; ... ; jmp ebx` is a continuation
@@ -1331,6 +1653,11 @@ class BatchTranslator:
             setjmp_fn=setjmp_fn, longjmp_fn=longjmp_fn,
             trace_functions=trace_functions)
         self.translator.discover_static_indirect_targets()
+        pointed = self.translator.discover_pointed_gap_functions()
+        if pointed:
+            import sys
+            print(f"Recovered {pointed} functions only a data pointer leads to",
+                  file=sys.stderr)
         self.translator.discover_cfg_ownership()
 
     def get_functions_by_category(self, categories=None, exclude_categories=None):
@@ -1480,7 +1807,8 @@ class BatchTranslator:
 
     def translate_batch_split(self, func_list, output_dir, chunk_size=1000,
                               header_name="recomp_funcs.h",
-                              prefix="recomp", verbose=False, manual=None):
+                              prefix="recomp", verbose=False, manual=None,
+                              wrapped=None):
         """
         Translate functions into multiple .c files + a shared header.
 
@@ -1497,6 +1825,12 @@ class BatchTranslator:
         is how a game replaces a recompiled XDK routine (a D3D8 entry point,
         say) with one that drives the host runtime instead of the hardware.
 
+        wrapped: {addr: name} for functions the project wraps -- it defines
+        `name` by hand and calls the generated body, which func_db names
+        name_gen. Direct calls and the dispatch table resolve to the wrapper,
+        not the body: a wrapper that only hand-written code could reach
+        intercepted nothing the game itself called.
+
         Returns dict with stats and list of generated files.
         """
         import sys
@@ -1511,6 +1845,8 @@ class BatchTranslator:
         # the override only took effect through a function pointer, and
         # every direct caller silently reached the generated body.
         self.translator.lifter.manual_functions = manual
+        wrapped = dict(wrapped or {})
+        self.translator.lifter.wrapped_functions = wrapped
         manual_decls = {}
 
         # Translate all functions first, collecting results
@@ -1545,6 +1881,19 @@ class BatchTranslator:
                 translations.append((addr, name, stub))
                 stats["failed"] += 1
 
+        # Code reached by a call or a tail jump where no function was
+        # detected is translated as a function of its own rather than stubbed.
+        # Its stub "returned" having done nothing, and popped only the return
+        # address: BLACK's XInitDevices is a `jmp 0x0027D058` thunk to a body
+        # the detector never saw, so its devices were never initialised and
+        # every caller's stack came back 8 bytes short.
+        undetected = self._translate_undetected_targets(
+            translations, manual_decls, wrapped, stats)
+        stats["undetected_entries"] = len(undetected)
+        if undetected:
+            print(f"  Translated {len(undetected)} call/jump targets no function "
+                  f"was detected at", file=sys.stderr)
+
         # Any address called but never defined needs a stub, or the link fails.
         # These are almost all mid-function entry points the function detector
         # did not split out: a call lands a few bytes inside (or just past) a
@@ -1554,6 +1903,7 @@ class BatchTranslator:
         # translated chunks.
         defined = {name for _, name, _ in translations}
         defined |= set(manual_decls.values())   # hand-written, but defined
+        defined |= set(wrapped.values())        # likewise
         unresolved = {
             addr: name
             for addr, name in self.translator.lifter.referenced_calls.items()
@@ -1595,6 +1945,13 @@ class BatchTranslator:
             for addr in sorted(manual_decls):
                 header_lines.append(
                     f"void {manual_decls[addr]}(void);  /* 0x{addr:08X} */")
+
+        if wrapped:
+            header_lines.append("")
+            header_lines.append("/* Hand-written wrappers around generated bodies */")
+            for addr in sorted(wrapped):
+                header_lines.append(
+                    f"void {wrapped[addr]}(void);  /* 0x{addr:08X} */")
 
         if unresolved:
             header_lines.append("")
@@ -1735,11 +2092,8 @@ class BatchTranslator:
             stub_lines.append("")
             for addr in sorted(unresolved):
                 popped = self.translator._stub_ret_bytes(addr)
-                note = (f"ret {popped}" if popped else "not detected")
-                stub_lines.append(
-                    f"void {unresolved[addr]}(void) {{ g_esp += {4 + popped}; "
-                    f"/* 0x{addr:08X}: {note} */ }}"
-                )
+                stub_lines.append(_render_unresolved_stub(
+                    addr, unresolved[addr], popped))
             stub_lines.append("")
 
             write_if_changed(stub_path, "\n".join(stub_lines))
@@ -1760,9 +2114,11 @@ class BatchTranslator:
         # _initterm and atexit. The header already declares them.
         # Sorted by address: recomp_lookup binary-searches this array, so an
         # appended entry would silently break every lookup past it.
+        # A wrapped address dispatches to the wrapper, as its direct calls do.
         dispatch_entries = sorted(
-            list(translations) + [(addr, name, None)
-                                  for addr, name in manual_decls.items()],
+            [(addr, wrapped.get(addr, name), code)
+             for addr, name, code in translations]
+            + [(addr, name, None) for addr, name in manual_decls.items()],
             key=lambda e: e[0])
         dispatch_path = os.path.join(output_dir, f"{prefix}_dispatch.c")
         self._write_dispatch_table(dispatch_entries, dispatch_path, header_name)
@@ -1772,6 +2128,51 @@ class BatchTranslator:
         stats["num_chunks"] = len(chunks)
         stats["chunk_size"] = chunk_size
         return stats
+
+    def _translate_undetected_targets(self, translations, manual_decls,
+                                      wrapped, stats, max_rounds=16):
+        """Translate referenced addresses nothing defines, where they are code.
+
+        Rounds, because a body translated from the middle of another function
+        can jump back into that function's head, which is another undetected
+        entry. Addresses outside the image's code bytes stay stubs: those
+        come from data decoded as code and are never executed.
+
+        Returns the addresses translated, and appends them to translations.
+        """
+        translator = self.translator
+        lifter = translator.lifter
+        starts = None
+        done = []
+        tried = set()
+
+        for _ in range(max_rounds):
+            defined = {name for _, name, _ in translations}
+            defined |= set(manual_decls.values())
+            defined |= set(wrapped.values())
+            pending = sorted(
+                addr for addr, name in lifter.referenced_calls.items()
+                if name not in defined and addr not in tried)
+            if not pending:
+                break
+            if starts is None:
+                starts = sorted(translator.func_db)
+            for addr in pending:
+                tried.add(addr)
+                end = translator.undetected_entry_end(addr, starts)
+                if end is None or end <= addr:
+                    continue
+                name = lifter.referenced_calls[addr]
+                info = {"start": f"0x{addr:08X}", "end": end, "_addr": addr,
+                        "size": end - addr, "name": name}
+                code = translator.translate_function(addr, info)
+                if not code:
+                    continue
+                translations.append((addr, name, code))
+                stats["translated"] += 1
+                stats["total_lines"] += code.count("\n")
+                done.append(addr)
+        return done
 
     def _write_dispatch_table(self, translations, output_path, header_name):
         """

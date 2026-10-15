@@ -178,6 +178,11 @@ def configured_from() -> Optional[str]:
     return _configured_from
 
 
+def sections():
+    """The installed section layout, in XBE order."""
+    return list(_SECTIONS)
+
+
 def va_to_file_offset(va):
     """Convert virtual address to XBE file offset."""
     for s in _SECTIONS:
@@ -197,6 +202,19 @@ def is_code_address(va):
         if s.va <= va < s.va + s.va_size:
             return s.is_code
     return False
+
+
+def code_bytes_end(va):
+    """End VA of the file-backed bytes of the code section holding va, or None.
+
+    The furthest a function starting at va can run: past it are BSS tails,
+    another section, or nothing."""
+    for s in _SECTIONS:
+        if s.va <= va < s.va + s.va_size:
+            if not s.is_code:
+                return None
+            return s.va + min(s.va_size, s.raw_size)
+    return None
 
 
 def is_data_address(va):
