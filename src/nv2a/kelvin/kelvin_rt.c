@@ -38,6 +38,7 @@
 #define KRT_DRAWS_MAX 4096u
 #define KRT_TEX_MAX 4096u
 #define KRT_TEX_PENDING 1024u
+#define KRT_STAMPS 7u
 
 typedef HRESULT (WINAPI *PfnCreateDevice)(IUnknown *, D3D_FEATURE_LEVEL, REFIID, void **);
 typedef HRESULT (WINAPI *PfnGetDebug)(REFIID, void **);
@@ -115,6 +116,14 @@ static struct {
     ID3D12Resource *history[2];         /* the lighting pass's, at the output's size */
     bool history_fresh;                 /* just made: nothing in it yet */
     ID3D12Resource *refl_raw, *refl_hist; /* the reflections before filtering, and the weapon's over frames */
+    /* RECOMP_KGPU_RT_TIMES=1 (diagnostic): GPU time of each pass, averaged over 120 frames */
+    int times;
+    ID3D12QueryHeap *qheap;
+    ID3D12Resource *qread;
+    uint64_t *qread_cpu, qfreq;
+    bool qpending[KRT_SLOTS];
+    double qsum[KRT_STAMPS];
+    unsigned qframes;
     ID3D12Resource *out;                /* written by the passes, read by D3D11 */
     unsigned out_w, out_h;
     bool said_frame;
@@ -281,6 +290,7 @@ void krt_shutdown(void)
     KRT_RELEASE(K.pso_calibrate); KRT_RELEASE(K.pso_calib_update); KRT_RELEASE(K.pso_light); KRT_RELEASE(K.pso_reflect_filter); KRT_RELEASE(K.sums); KRT_RELEASE(K.factors); KRT_RELEASE(K.root); KRT_RELEASE(K.heap);
     KRT_RELEASE(K.list);
     for (i = 0; i < KRT_SLOTS; i++) KRT_RELEASE(K.alloc[i]);
+    KRT_RELEASE(K.qread); KRT_RELEASE(K.qheap); K.times = 0;
     KRT_RELEASE(K.queue); KRT_RELEASE(K.fence); KRT_RELEASE(K.dev);
     KRT_RELEASE(K.fence11); KRT_RELEASE(K.ctx11); KRT_RELEASE(K.dev11);
     if (K.fence_h) { CloseHandle(K.fence_h); K.fence_h = NULL; }
@@ -329,11 +339,35 @@ static uint64_t submit(void)
     return K.fence_value;
 }
 
+/* The pass times this slot measured last time it ran (its GPU work is done by now). */
+static void collect_times(void)
+{
+    static const char *const names[KRT_STAMPS - 1] = { "unpack", "build", "calibrate", "lighting", "reflections", "view" };
+    const uint64_t *q = K.qread_cpu + (size_t)K.slot * 16;
+    unsigned i;
+    if (!K.times || !K.qpending[K.slot]) return;
+    K.qpending[K.slot] = false;
+    for (i = 1; i < KRT_STAMPS; i++) K.qsum[i - 1] += (double)(q[i] - q[i - 1]) * 1000.0 / (double)K.qfreq;
+    if (++K.qframes == 120) {
+        double total = 0.0;
+        fprintf(stderr, "[KRT] GPU ms a frame:");
+        for (i = 0; i + 1 < KRT_STAMPS; i++) { fprintf(stderr, " %s %.2f", names[i], K.qsum[i] / 120.0); total += K.qsum[i]; K.qsum[i] = 0.0; }
+        fprintf(stderr, " = %.2f\n", total / 120.0);
+        K.qframes = 0;
+    }
+}
+
+static void stamp(unsigned i)
+{
+    if (K.times) ID3D12GraphicsCommandList4_EndQuery(K.list, K.qheap, D3D12_QUERY_TYPE_TIMESTAMP, K.slot * 16 + i);
+}
+
 /* Opens the command list on the next allocator, once the GPU is done with that allocator's last frame. */
 static bool open_list(void)
 {
     K.slot = (K.slot + 1) % KRT_SLOTS;
     wait_fence(K.alloc_done[K.slot]);
+    collect_times();
     return SUCCEEDED(ID3D12CommandAllocator_Reset(K.alloc[K.slot])) &&
            SUCCEEDED(ID3D12GraphicsCommandList4_Reset(K.list, K.alloc[K.slot], NULL));
 }
@@ -550,6 +584,16 @@ bool krt_init(ID3D11Device *dev, ID3D11DeviceContext *ctx, LUID adapter_luid)
     }
     ID3D12GraphicsCommandList4_Close(K.list);
     K.fence_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+    if (getenv("RECOMP_KGPU_RT_TIMES")) {
+        D3D12_QUERY_HEAP_DESC qd2;
+        memset(&qd2, 0, sizeof(qd2));
+        qd2.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP; qd2.Count = KRT_SLOTS * 16;
+        if (SUCCEEDED(ID3D12Device5_CreateQueryHeap(K.dev, &qd2, &IID_ID3D12QueryHeap, (void **)&K.qheap)) &&
+            (K.qread = make_buffer((UINT64)KRT_SLOTS * 16 * 8, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST)) != NULL &&
+            SUCCEEDED(ID3D12Resource_Map(K.qread, 0, NULL, (void **)&K.qread_cpu)) &&
+            SUCCEEDED(ID3D12CommandQueue_GetTimestampFrequency(K.queue, &K.qfreq)))
+            K.times = 1;
+    }
 
     if (FAILED(ID3D11Device_QueryInterface(dev, &IID_ID3D11Device5, (void **)&K.dev11)) ||
         FAILED(ID3D11DeviceContext_QueryInterface(ctx, &IID_ID3D11DeviceContext4, (void **)&K.ctx11)) ||
@@ -684,14 +728,16 @@ bool krt_set_inputs(HANDLE picture, HANDLE weight, HANDLE surface, HANDLE depth,
         write_trace_tables();
         return false;
     }
-    /* the lighting pass's history, its own */
+    /* the lighting pass's history (at half the size, as the pass runs) and the reflections', their own */
     memset(&hp, 0, sizeof(hp));
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     memset(&rd, 0, sizeof(rd));
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width = K.out_w; rd.Height = K.out_h; rd.DepthOrArraySize = 1;
     rd.MipLevels = 1; rd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; rd.SampleDesc.Count = 1;
     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    for (i = 0; i < 4; i++)
+    for (i = 0; i < 4; i++) {
+        rd.Width = i < 2 ? (K.out_w + 1) / 2 : K.out_w;
+        rd.Height = i < 2 ? (K.out_h + 1) / 2 : K.out_h;
         if (FAILED(ID3D12Device5_CreateCommittedResource(K.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL,
                                                          &IID_ID3D12Resource,
                                                          (void **)(i < 2 ? &K.history[i] : i == 2 ? &K.refl_raw : &K.refl_hist)))) {
@@ -700,6 +746,7 @@ bool krt_set_inputs(HANDLE picture, HANDLE weight, HANDLE surface, HANDLE depth,
             write_trace_tables();
             return false;
         }
+    }
     memset(&u, 0, sizeof(u));
     u.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     u.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
@@ -857,6 +904,7 @@ bool krt_frame(const KrtFrame *f)
         barrier(K.uv, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         barrier(K.col, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
+    stamp(0);
     ID3D12GraphicsCommandList4_SetPipelineState(K.list, K.pso_unpack);
     ID3D12GraphicsCommandList4_SetComputeRootConstantBufferView(K.list, 0, cva);
     ID3D12GraphicsCommandList4_SetComputeRootDescriptorTable(K.list, 1, gpu_handle(H_UNPACK_SRV));
@@ -867,6 +915,7 @@ bool krt_frame(const KrtFrame *f)
     barrier(K.col, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     barrier(K.geo, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     K.vb_readable = true;
+    stamp(1);
 
     /* Build: the two bottom levels, one after the other through the same scratch, then the top level over them. */
     for (k = 0; k < 2; k++) {
@@ -885,6 +934,7 @@ bool krt_frame(const KrtFrame *f)
     build.ScratchAccelerationStructureData = ID3D12Resource_GetGPUVirtualAddress(K.scratch);
     ID3D12GraphicsCommandList4_BuildRaytracingAccelerationStructure(K.list, &build, 0, NULL);
     uav_barrier(K.tlas);
+    stamp(2);
 
     if (f->calibrate && K.out && K.in_pic) {
         /* the brightness factors, from what the camera sees of the picture this frame */
@@ -901,6 +951,7 @@ bool krt_frame(const KrtFrame *f)
         uav_barrier(K.sums);
         barrier(K.in_pic, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     }
+    stamp(3);
     if (f->lighting && K.in_depth && K.light_out && K.history[0]) {
         ID3D12GraphicsCommandList4_SetPipelineState(K.list, K.pso_light);
         ID3D12GraphicsCommandList4_SetComputeRootConstantBufferView(K.list, 0, cva + 256);
@@ -908,12 +959,13 @@ bool krt_frame(const KrtFrame *f)
         ID3D12GraphicsCommandList4_SetComputeRootDescriptorTable(K.list, 2, gpu_handle(H_TRACE_UAV));
         barrier(K.in_depth, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         barrier(K.light_out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        ID3D12GraphicsCommandList4_Dispatch(K.list, (K.out_w + 7) / 8, (K.out_h + 7) / 8, 1);
+        ID3D12GraphicsCommandList4_Dispatch(K.list, ((K.out_w + 1) / 2 + 7) / 8, ((K.out_h + 1) / 2 + 7) / 8, 1);
         barrier(K.light_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
         barrier(K.in_depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
         K.history_fresh = false;
         wrote = true;
     }
+    stamp(4);
     if (f->reflect && !f->view && K.out && K.in_pic && K.in_w && K.in_g && K.refl_raw) {
         ID3D12GraphicsCommandList4_SetPipelineState(K.list, K.pso_reflect);
         ID3D12GraphicsCommandList4_SetComputeRootConstantBufferView(K.list, 0, cva + 256);
@@ -934,6 +986,7 @@ bool krt_frame(const KrtFrame *f)
         barrier(K.in_pic, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
         wrote = true;
     }
+    stamp(5);
     if (f->view && K.out) {
         ID3D12GraphicsCommandList4_SetPipelineState(K.list, K.pso_view);
         ID3D12GraphicsCommandList4_SetComputeRootConstantBufferView(K.list, 0, cva + 256);
@@ -947,6 +1000,12 @@ bool krt_frame(const KrtFrame *f)
         wrote = true;
     }
 
+    stamp(6);
+    if (K.times) {
+        ID3D12GraphicsCommandList4_ResolveQueryData(K.list, K.qheap, D3D12_QUERY_TYPE_TIMESTAMP, K.slot * 16, KRT_STAMPS, K.qread,
+                                                    (UINT64)K.slot * 16 * 8);
+        K.qpending[K.slot] = true;
+    }
     done = submit();
     K.alloc_done[K.slot] = done;
     ID3D11DeviceContext4_Wait(K.ctx11, K.fence11, done);

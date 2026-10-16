@@ -6,8 +6,9 @@
 // 2): characters, props, debris. Those are shadowed and occluded by everything, and take on the colour of what is
 // around them. The light is the main light the ambient coefficients point at (kg_rtc_light).
 //
-// One shadow ray and two occlusion rays a pixel, a different sample each frame, averaged over frames: the history is
-// last frame's result where this pixel's surface was then (last frame's camera), kept if it was the same surface.
+// At half the output's width and height, a different one of each 2x2 block's pixels each frame: one shadow ray and two
+// occlusion rays, averaged over frames. The history is last frame's result where this pixel's surface was then (last
+// frame's camera), kept if it was the same surface. The composite scales the result up.
 #include "krt_common.hlsli"
 
 Texture2D<float> depth : register(t8);      // the frame's depth buffer
@@ -47,14 +48,16 @@ bool prev_pixel(float3 p, out float2 px, out float w)
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID)
 {
-    if (any(id.xy >= (uint2)size.xy)) return;
+    uint2 half_size = ((uint2)size.xy + 1u) / 2u;
+    if (any(id.xy >= half_size)) return;
     uint f = (uint)misc.x;
     bool odd = (f & 1u) != 0;
+    uint2 px = min(id.xy * 2u + uint2(f & 1u, (f >> 1) & 1u), (uint2)size.xy - 1u);
     float4 now = float4(1.0, 1.0, 1.0, 0.0);
     float3 P = 0.0;
-    float d = depth.Load(int3(id.xy, 0));
+    float d = depth.Load(int3(px, 0));
     if (d < 0.99999) {
-        RayDesc cr = camera_ray(id.xy);
+        RayDesc cr = camera_ray(px);
         Hit h = first_hit(cr);
         float drawn = view_w_from_depth(d);
         P = cr.Origin + cr.Direction * (h.found ? h.t : 0.0);
@@ -68,7 +71,7 @@ void main(uint3 id : SV_DispatchThreadID)
             float3 N = normalize(cross(b - a, c - a));
             if (dot(N, cr.Direction) > 0.0) N = -N;
             float3 O = P + N * (0.002 * drawn + 0.01);
-            float2 u = float2(hash(id.xy, f * 3u), hash(id.xy, f * 3u + 1u));
+            float2 u = float2(hash(px, f * 3u), hash(px, f * 3u + 1u));
 
             float shadow = 1.0;
             float ndl = dot(N, light.xyz);
@@ -107,11 +110,12 @@ void main(uint3 id : SV_DispatchThreadID)
     // last frame's result for this surface, if it was there
     float4 result = now;
     if (now.a > 0.0 && misc.y > 0.5) {
-        float2 px;
+        float2 pq;
         float w;
-        if (prev_pixel(P, px, w)) {
-            float4 old = odd ? history_b[(uint2)px] : history_a[(uint2)px];
-            if (old.a > 0.0 && abs(old.a - w) < 0.03 * w + 0.05) result.rgb = lerp(now.rgb, old.rgb, 0.85);
+        if (prev_pixel(P, pq, w)) {
+            uint2 hq = min((uint2)(pq * 0.5), half_size - 1u);
+            float4 old = odd ? history_b[hq] : history_a[hq];
+            if (old.a > 0.0 && abs(old.a - w) < 0.05 * w + 0.1) result.rgb = lerp(now.rgb, old.rgb, 0.85);
         }
     }
     if (odd) history_a[id.xy] = result; else history_b[id.xy] = result;

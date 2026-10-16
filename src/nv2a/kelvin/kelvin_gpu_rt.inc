@@ -54,7 +54,7 @@ static struct {
     ID3D11RenderTargetView *depth_rtv;
     ID3D11ShaderResourceView *lit_srv;
     HANDLE depth_h, lit_h;
-    ID3D11PixelShader *ps_depth, *ps_lit;
+    ID3D11PixelShader *ps_depth, *ps_lit, *ps_view_half;
     ID3D11ShaderResourceView *out_srv;
     HANDLE out_h;
     unsigned out_w, out_hh;
@@ -72,12 +72,23 @@ static struct {
 static const char kg_rtc_depth_hlsl[] =
     "Texture2D<float4> z : register(t0);\n"
     "float main(float4 p : SV_Position) : SV_Target { return z.Load(int3(p.xy, 0)).r; }\n";
+/* The lighting factor is made at half the size: scaled up with a linear filter. */
 static const char kg_rtc_lit_hlsl[] =
     "Texture2D<float4> pic : register(t0);\n"
     "Texture2D<float4> lit : register(t1);\n"
+    "SamplerState lin : register(s0);\n"
     "float4 main(float4 p : SV_Position) : SV_Target {\n"
+    "    uint w, h; pic.GetDimensions(w, h);\n"
     "    float4 c = pic.Load(int3(p.xy, 0));\n"
-    "    return float4(c.rgb * lit.Load(int3(p.xy, 0)).rgb, c.a);\n"
+    "    return float4(c.rgb * lit.SampleLevel(lin, p.xy / float2(w, h), 0).rgb, c.a);\n"
+    "}\n";
+static const char kg_rtc_view_half_hlsl[] =
+    "Texture2D<float4> rt : register(t0);\n"
+    "SamplerState lin : register(s0);\n"
+    "float4 main(float4 p : SV_Position) : SV_Target {\n"
+    "    uint w, h; rt.GetDimensions(w, h);\n"
+    "    if (p.x > w) discard;   // the left half: the picture stays on the right to compare\n"
+    "    return float4(rt.SampleLevel(lin, p.xy / float2(w * 2, h * 2), 0).rgb, 1.0);\n"
     "}\n";
 
 static const char kg_rtc_view_hlsl[] =
@@ -178,6 +189,11 @@ static bool kg_rtc_setup(void)
     code = compile_hlsl("", kg_rtc_depth_hlsl, "main", "ps_5_0");
     if (code) {
         ID3D11Device_CreatePixelShader(G.dev, ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code), NULL, &s_rtc.ps_depth);
+        ID3D10Blob_Release(code);
+    }
+    code = compile_hlsl("", kg_rtc_view_half_hlsl, "main", "ps_5_0");
+    if (code) {
+        ID3D11Device_CreatePixelShader(G.dev, ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code), NULL, &s_rtc.ps_view_half);
         ID3D10Blob_Release(code);
     }
     code = compile_hlsl("", kg_rtc_lit_hlsl, "main", "ps_5_0");
@@ -405,7 +421,8 @@ static bool kg_rtc_output(unsigned w, unsigned h)
         if (!kg_rtc_shared(w, h, in_fmt[i], 0, &s_rtc.in[i], i ? NULL : &s_rtc.pic_srv, &s_rtc.in_h[i])) goto fail;
     if (!kg_rtc_shared(w, h, DXGI_FORMAT_R32_FLOAT, D3D11_BIND_RENDER_TARGET, &s_rtc.depth, NULL, &s_rtc.depth_h) ||
         FAILED(ID3D11Device_CreateRenderTargetView(G.dev, (ID3D11Resource *)s_rtc.depth, NULL, &s_rtc.depth_rtv)) ||
-        !kg_rtc_shared(w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_UNORDERED_ACCESS, &s_rtc.lit, &s_rtc.lit_srv, &s_rtc.lit_h))
+        !kg_rtc_shared((w + 1) / 2, (h + 1) / 2, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_UNORDERED_ACCESS, &s_rtc.lit, &s_rtc.lit_srv,
+                       &s_rtc.lit_h))
         goto fail;
     if (!krt_set_output(s_rtc.out_h, w, h) ||
         !krt_set_inputs(s_rtc.in_h[0], s_rtc.in_h[1], s_rtc.in_h[2], s_rtc.depth_h, s_rtc.lit_h)) goto fail;
@@ -604,7 +621,7 @@ static void kg_rtc_finish(KGpuSurf *cs, KGpuSurf *zs)
         kg_cache_invalidate();
     } else {
         if (f.lighting) {
-            if (s_rtc.view == 4) post_pass(s_rtc.ps_view, cs->rtv, cs->hw, cs->hh, s_rtc.lit_srv, NULL, NULL, NULL);
+            if (s_rtc.view == 4) post_pass(s_rtc.ps_view_half, cs->rtv, cs->hw, cs->hh, s_rtc.lit_srv, NULL, NULL, NULL);
             else post_pass(s_rtc.ps_lit, cs->rtv, cs->hw, cs->hh, s_rtc.pic_srv, s_rtc.lit_srv, NULL, NULL);
             kg_cache_invalidate();
         }
