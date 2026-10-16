@@ -10,6 +10,7 @@
 #include "pc_movie_skip.h"
 #include "pc_photo.h"
 #include "pc_crosshair.h"
+#include "pc_debug.h"
 #if defined(_WIN32)
 #define COBJMACROS
 #include <windows.h>
@@ -26,6 +27,7 @@ enum { FB_NOT_STARTED, FB_RUNNING, FB_CLOSED };
 typedef struct FbFrame {
     uint32_t width, height, va, aspect_w, aspect_h;
     uint64_t movie_token;
+    int64_t published;       /* pc_debug_note_publish */
     uint64_t gpu_value;      /* a GPU-resident frame: no pixels, a slot of the shared ring */
     unsigned gpu_slot;
     int gpu;
@@ -50,6 +52,10 @@ typedef struct FbGpu {
     unsigned ovl_w, ovl_h; int overlay_on;
     /* the crosshair and hit markers (pc_crosshair.h) */
     ID3D11PixelShader *xh_ps; ID3D11Buffer *xh_cb;
+    /* the debug overlay (pc_debug.h): its panel and where it goes in the window */
+    ID3D11Texture2D *dbg_tex; ID3D11ShaderResourceView *dbg_view;
+    unsigned dbg_w, dbg_h; int dbg_x, dbg_y, dbg_on;
+    IDXGIAdapter3 *adapter3;
 } FbGpu;
 /* Test-only observers compile away in the runtime. The device fixture reads
  * the actual backbuffer before flip; it does not replace rendering behavior. */
@@ -185,6 +191,7 @@ static void fb_publish(const void *source, size_t source_bytes, uint32_t va,
     if (!frame) return;
     frame->width = width; frame->height = height; frame->va = va;
     frame->movie_token = movie_token; frame->aspect_w = aspect_w; frame->aspect_h = aspect_h;
+    frame->published = pc_debug_note_publish();
     for (y = 0; y < height; ++y) {
         const uint8_t *row = bytes + (size_t)y * pitch;
         uint32_t *dst = frame->pixels + (size_t)y * width;
@@ -252,6 +259,7 @@ void xbox_FramebufferPublishGpu(unsigned slot, uint64_t value, uint32_t va,
     frame->width = s_gpu_w; frame->height = s_gpu_h; frame->va = va;
     frame->aspect_w = aspect_w; frame->aspect_h = aspect_h;
     frame->gpu = 1; frame->gpu_slot = slot; frame->gpu_value = value;
+    frame->published = pc_debug_note_publish();
     AcquireSRWLockExclusive(&s_frames_lock);
     if (InterlockedCompareExchange(&s_state, 0, 0) == FB_CLOSED || s_movie_token != 0) {
         ReleaseSRWLockExclusive(&s_frames_lock); free(frame); _mm_setcsr(csr); return;
@@ -524,6 +532,9 @@ static LRESULT CALLBACK fb_wndproc(HWND hwnd, UINT message, WPARAM w, LPARAM l)
         if (message == WM_PAINT) { PAINTSTRUCT p; BeginPaint(hwnd, &p); EndPaint(hwnd, &p); }
         return 0;
     }
+    if ((message == WM_KEYDOWN || message == WM_KEYUP) && w == VK_INSERT) {
+        if (message == WM_KEYDOWN && !(l & (1u << 30))) pc_debug_toggle(); return 0;
+    }
     if (message == WM_KEYDOWN && w == VK_F11) {
         if (!(l & (1u << 30))) InterlockedExchange(&s_toggle, 1); return 0;
     }
@@ -602,6 +613,7 @@ static void fb_gpu_close(FbGpu *g)
     FB_RELEASE(g->frame_fence); FB_RELEASE(g->done_fence); FB_RELEASE(g->ctx4);
     FB_RELEASE(g->ovl_view); FB_RELEASE(g->ovl_tex); FB_RELEASE(g->ovl_blend); FB_RELEASE(g->ovl_ps);
     FB_RELEASE(g->xh_ps); FB_RELEASE(g->xh_cb);
+    FB_RELEASE(g->dbg_view); FB_RELEASE(g->dbg_tex); FB_RELEASE(g->adapter3);
     FB_RELEASE(g->ramp_view); FB_RELEASE(g->ramp_tex);
     FB_RELEASE(g->raster); FB_RELEASE(g->point); FB_RELEASE(g->linear); FB_RELEASE(g->ps); FB_RELEASE(g->vs); FB_RELEASE(g->vs_cinematic);
     FB_RELEASE(g->view); FB_RELEASE(g->texture); FB_RELEASE(g->target); FB_RELEASE(g->swap);
@@ -844,6 +856,68 @@ static void fb_crosshair_draw(FbGpu *g, const FbPresentRect *r)
     ID3D11DeviceContext_Draw(g->context, 3, 0);
     ID3D11DeviceContext_OMSetBlendState(g->context, NULL, factor, 0xFFFFFFFFu);
 }
+/* The debug overlay's rows into its panel texture, at the picture's top-left corner (pc_debug.h). */
+static void fb_debug_update(FbGpu *g, const FbPresentRect *r, unsigned *need_draw)
+{
+    PcDebugRow rows[PC_DEBUG_ROWS];
+    const char *labels[PC_DEBUG_ROWS], *values[PC_DEBUG_ROWS];
+    const uint32_t *pixels;
+    unsigned w, h;
+    int n, changed, i, x, y;
+    float scale;
+    if (!pc_debug_visible()) { if (g->dbg_on) *need_draw = 1; g->dbg_on = 0; pc_debug_rows(rows, PC_DEBUG_ROWS, &changed); return; }
+    if (g->device && !g->adapter3) {
+        IDXGIDevice *dxgi = NULL; IDXGIAdapter *adapter = NULL;
+        if (SUCCEEDED(ID3D11Device_QueryInterface(g->device, &IID_IDXGIDevice, (void **)&dxgi)) &&
+            SUCCEEDED(IDXGIDevice_GetAdapter(dxgi, &adapter)))
+            IDXGIAdapter_QueryInterface(adapter, &IID_IDXGIAdapter3, (void **)&g->adapter3);
+        FB_RELEASE(adapter); FB_RELEASE(dxgi);
+    }
+    n = pc_debug_rows(rows, PC_DEBUG_ROWS, &changed);
+    if (changed && g->adapter3) {
+        DXGI_QUERY_VIDEO_MEMORY_INFO info;
+        if (SUCCEEDED(IDXGIAdapter3_QueryVideoMemoryInfo(g->adapter3, 0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)))
+            pc_debug_note_vram(info.CurrentUsage);
+    }
+    scale = (float)r->height / 480.0f * 0.62f;
+    if (scale < 1.0f) scale = 1.0f;
+    x = r->x + (int)(10.0f * scale); y = r->y + (int)(10.0f * scale);
+    if (x != g->dbg_x || y != g->dbg_y) { changed = 1; g->dbg_x = x; g->dbg_y = y; }
+    if (!changed && g->dbg_on) return;
+    for (i = 0; i < n; i++) { labels[i] = rows[i].label; values[i] = rows[i].value; }
+    if (!pc_menu_panel("DEBUG", labels, values, n, scale, &pixels, &w, &h)) return;
+    if (!g->dbg_tex || g->dbg_w != w || g->dbg_h != h) {
+        D3D11_TEXTURE2D_DESC desc = {0};
+        FB_RELEASE(g->dbg_view); FB_RELEASE(g->dbg_tex);
+        desc.Width = w; desc.Height = h; desc.MipLevels = desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM; desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT; desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(ID3D11Device_CreateTexture2D(g->device, &desc, NULL, &g->dbg_tex))) return;
+        if (FAILED(ID3D11Device_CreateShaderResourceView(g->device, (ID3D11Resource *)g->dbg_tex, NULL, &g->dbg_view))) {
+            FB_RELEASE(g->dbg_tex); return;
+        }
+        g->dbg_w = w; g->dbg_h = h;
+    }
+    ID3D11DeviceContext_UpdateSubresource(g->context, (ID3D11Resource *)g->dbg_tex, 0, NULL, pixels, w * 4, 0);
+    g->dbg_on = 1;
+    *need_draw = 1;
+}
+static void fb_debug_draw(FbGpu *g)
+{
+    D3D11_VIEWPORT viewport;
+    const FLOAT factor[4] = {0, 0, 0, 0};
+    if (!g->dbg_on || !g->dbg_view || !g->ovl_ps || !g->ovl_blend || pc_photo_active()) return;
+    viewport.TopLeftX = (FLOAT)g->dbg_x; viewport.TopLeftY = (FLOAT)g->dbg_y;
+    viewport.Width = (FLOAT)g->dbg_w; viewport.Height = (FLOAT)g->dbg_h; viewport.MinDepth = 0; viewport.MaxDepth = 1;
+    ID3D11DeviceContext_RSSetViewports(g->context, 1, &viewport);
+    ID3D11DeviceContext_VSSetShader(g->context, g->vs, NULL, 0);
+    ID3D11DeviceContext_OMSetBlendState(g->context, g->ovl_blend, factor, 0xFFFFFFFFu);
+    ID3D11DeviceContext_PSSetShader(g->context, g->ovl_ps, NULL, 0);
+    ID3D11DeviceContext_PSSetSamplers(g->context, 0, 1, &g->point);
+    ID3D11DeviceContext_PSSetShaderResources(g->context, 0, 1, &g->dbg_view);
+    ID3D11DeviceContext_Draw(g->context, 3, 0);
+    ID3D11DeviceContext_OMSetBlendState(g->context, NULL, factor, 0xFFFFFFFFu);
+}
 static HRESULT fb_gpu_draw(FbGpu *g, const FbFrame *frame)
 {
     D3D11_VIEWPORT viewport;
@@ -914,6 +988,7 @@ static HRESULT fb_gpu_draw(FbGpu *g, const FbFrame *frame)
         ID3D11DeviceContext_Draw(g->context, 3, 0);
         ID3D11DeviceContext_OMSetBlendState(g->context, NULL, factor, 0xFFFFFFFFu);
     }
+    fb_debug_draw(g);
     if (frame->gpu && frame->gpu_value > g->done_signaled) {
         ID3D11DeviceContext4_Signal(g->ctx4, g->done_fence, frame->gpu_value);
         g->done_signaled = frame->gpu_value;
@@ -926,7 +1001,7 @@ static HRESULT fb_gpu_draw(FbGpu *g, const FbFrame *frame)
 static DWORD WINAPI fb_thread(LPVOID unused)
 {
     WNDCLASSA wc = {0}; FbGpu gpu = {0}; HWND hwnd; RECT rect = {0, 0, 0, 0};
-    FbFrame *frame = NULL; unsigned need_draw = 0, displayed = 0, applied_generation = pc_video_generation();
+    FbFrame *frame = NULL; int64_t presented = -1; unsigned need_draw = 0, displayed = 0, applied_generation = pc_video_generation();
     LARGE_INTEGER frequency, next = {0}; HRESULT hr; (void)unused;
     /* Host graphics/driver code has its own standard FP environment; the
      * producer may have entered Start under any guest rounding/mask state. */
@@ -998,6 +1073,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                 if (gpu.overlay_on && s_menu_shot && !s_backbuffer_dump[0])
                     snprintf(s_backbuffer_dump, sizeof(s_backbuffer_dump), "%s%03u.bmp", s_menu_shot, ++s_menu_shots);
             }
+            fb_debug_update(&gpu, &pr, &need_draw);
         }
         fb_capture_update(hwnd);
         latest = fb_take_latest(); if (latest != frame) { frame = latest; need_draw = 1; }
@@ -1011,6 +1087,8 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                     hr = fb_target(&gpu, client.right, client.bottom);
                 if (SUCCEEDED(hr)) hr = fb_gpu_draw(&gpu, frame);
                 if (FAILED(hr)) { fprintf(stderr, "[FBWIN] D3D11 present failed: %08lX\n", (unsigned long)hr); break; }
+                pc_debug_note_present(frame->published, frame->published != presented);
+                presented = frame->published;
                 /* Cap presentation start-to-start. Adding a full interval
                  * after blocking Present would count the vsync wait twice. */
                 next.QuadPart = s_policy.fps_limit ? now.QuadPart + frequency.QuadPart / s_policy.fps_limit : 0;

@@ -25,6 +25,7 @@
 #include "../../video/fb_present.h"
 #include "../../video/pc_video.h"
 #include "../../video/pc_crosshair.h"
+#include "../../video/pc_debug.h"
 
 #include "kelvin_gpu_hlsl.inc"
 
@@ -1934,6 +1935,11 @@ static void kgpu_flip_inner(const KelvinTarget *t, unsigned int color_format, ui
     n = ++G.frames;
     kt_end(n);
     kt_poll();
+    if (pc_debug_visible()) {
+        static uint64_t draws_before;
+        pc_debug_note_render(kt_take_ms(), (unsigned)(G.draws - draws_before), G.host_w, G.host_h, G.out_w, G.out_h);
+        draws_before = G.draws;
+    }
     if ((n % 120) == 0 && G.dev) {
         /* A removed or reset device (driver update, TDR) leaves every later call failing quietly; say so once. */
         static bool lost_said;

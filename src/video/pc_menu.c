@@ -2791,6 +2791,54 @@ int pc_menu_overlay(unsigned w, unsigned h, int px, int py, unsigned pw, unsigne
     return 1;
 }
 
+/* ---- panels ------------------------------------------------------------------------------------------------------- */
+
+int pc_menu_panel(const char *title, const char *const *labels, const char *const *values, int n, float scale,
+                  const uint32_t **pixels, unsigned *w, unsigned *h)
+{
+    static Display d;
+    static uint32_t *buf;
+    static size_t cap;
+    const float pad = 9.0f, title_size = 17.0f, size = 11.0f, step = 14.0f, gap = 14.0f;
+    const int title_font = m_font[PCM_FONT_BIG].pixels ? PCM_FONT_BIG : PCM_FONT_SMALL;
+    uint16_t text[PCM_TEXT_CAP];
+    float label_w = 0.0f, value_w = 0.0f, pw, ph, y;
+    unsigned bw, bh;
+    int i;
+    if (!m_font[PCM_FONT_SMALL].pixels || scale <= 0.0f || n < 0) return 0;
+    for (i = 0; i < n; i++) {
+        utf8_to_utf16(labels[i], text, PCM_TEXT_CAP);
+        label_w = fmaxf(label_w, text_width(PCM_FONT_SMALL, text, size));
+        utf8_to_utf16(values[i], text, PCM_TEXT_CAP);
+        value_w = fmaxf(value_w, text_width(PCM_FONT_SMALL, text, size));
+    }
+    utf8_to_utf16(title, text, PCM_TEXT_CAP);
+    pw = fmaxf(pad + 4.0f + label_w + gap + value_w + pad, pad + 4.0f + text_width(title_font, text, title_size) + pad);
+    pw = fmaxf(pw, 180.0f);
+    ph = pad + title_size + 8.0f + step * (float)n + pad - 3.0f;
+    bw = (unsigned)ceilf(pw * scale); bh = (unsigned)ceilf(ph * scale);
+    if ((size_t)bw * bh > cap) {
+        uint32_t *next = (uint32_t *)realloc(buf, (size_t)bw * bh * 4);
+        if (!next) return 0;
+        buf = next; cap = (size_t)bw * bh;
+    }
+    /* the pause menu's look over the game: its dark bar, the rail at the left, its grey title, green labels */
+    d.n = 0; d.slide = 0;
+    rect(&d, 0, 0, pw, ph, 0xD0090B0Au, 0);
+    rect(&d, 0, 0, 2.0f, ph, 0xFF5A6057u, 0);
+    text_prim(&d, title_font, pad + 4.0f, pad, title_size, 1.0f, 0xFFB4B4B4u, text);
+    rect(&d, pad + 4.0f, pad + title_size + 3.0f, pw - 2.0f * pad - 4.0f, 1.0f, 0xFF5A6057u, 0);
+    for (i = 0, y = pad + title_size + 9.0f; i < n; i++, y += step) {
+        utf8_to_utf16(labels[i], text, PCM_TEXT_CAP);
+        text_prim(&d, PCM_FONT_SMALL, pad + 4.0f, y, size, 1.0f, 0xFF6F917Cu, text);
+        utf8_to_utf16(values[i], text, PCM_TEXT_CAP);
+        text_prim(&d, PCM_FONT_SMALL, pad + 4.0f + label_w + gap, y, size, 1.0f, 0xFFE0E0E0u, text);
+    }
+    render(&d, buf, bw, bh, 0, 0, (unsigned)(640.0f * scale + 0.5f), (unsigned)(480.0f * scale + 0.5f));
+    *pixels = buf; *w = bw; *h = bh;
+    return 1;
+}
+
 /* ---- tests -------------------------------------------------------------------------------------------------------- */
 
 void pc_menu_test_reset(const char *definition)
@@ -2878,6 +2926,9 @@ void pc_menu_install(void) {}
 int pc_menu_active(void) { return 0; }
 int pc_menu_overlay(unsigned w, unsigned h, int px, int py, unsigned pw, unsigned ph, const uint32_t **pixels, int *changed)
 { (void)px; (void)py; (void)pw; (void)ph; return pc_video_menu_overlay(w, h, pixels, changed); }
+int pc_menu_panel(const char *title, const char *const *labels, const char *const *values, int n, float scale,
+                  const uint32_t **pixels, unsigned *w, unsigned *h)
+{ (void)title; (void)labels; (void)values; (void)n; (void)scale; (void)pixels; (void)w; (void)h; return 0; }
 int pc_menu_check_definition(const char *text, char *log, size_t cap) { (void)text; (void)log; (void)cap; return 0; }
 const char *pc_menu_definition_path(void) { return ""; }
 void pc_menu_test_reset(const char *d) { (void)d; }

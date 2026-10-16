@@ -133,6 +133,12 @@ int pc_menu_overlay(unsigned w, unsigned h, int px, int py, unsigned pw, unsigne
  * needs uploading. 0 when it cannot say (upload everything). */
 int pc_menu_overlay_dirty(unsigned box[4]);
 
+/* Presenter thread: a box of label / value rows under a title, in the pages' look and fonts (the debug overlay), at
+ * `scale` window pixels per menu unit. *pixels (premultiplied BGRA, *w x *h) stays valid until the next call. 0 when
+ * no font is registered yet. */
+int pc_menu_panel(const char *title, const char *const *labels, const char *const *values, int n, float scale,
+                  const uint32_t **pixels, unsigned *w, unsigned *h);
+
 /* ---- the definition -------------------------------------------------------------------------------------- */
 
 /* Parses definition text. Returns the number of valid pages; errors are written one per line to `log`

@@ -10,6 +10,7 @@ add_library(xbox_video STATIC
     pc_movie_skip.c
     pc_photo.c
     pc_crosshair.c
+    pc_debug.c
 )
 target_include_directories(xbox_video PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
