@@ -1,6 +1,7 @@
 /* The native Video Settings page. See pc_video_menu.h. */
 #include "pc_video_menu.h"
 #include "pc_video.h"
+#include "pc_crosshair.h"
 #include "../input/pc_input.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,7 +21,8 @@ enum {
     R_DOF = PCV_ROW_DOF, R_SHARPEN = PCV_ROW_SHARPEN, R_ASPECT = PCV_ROW_ASPECT, R_FOV = PCV_ROW_FOV, R_SCALE = PCV_ROW_SCALE,
     R_AO_METHOD = PCV_ROW_AO_METHOD, R_AO_QUALITY = PCV_ROW_AO_QUALITY, R_REFLECTIONS = PCV_ROW_REFLECTIONS,
     R_RAY_TRACING = PCV_ROW_RAY_TRACING,
-    R_FILTER = PCV_ROW_FILTER, R_VSYNC = PCV_ROW_VSYNC, R_FPS = PCV_ROW_FPS, R_BLUR = PCV_ROW_BLUR, R_RESET = PCV_ROW_RESET,
+    R_FILTER = PCV_ROW_FILTER, R_VSYNC = PCV_ROW_VSYNC, R_FPS = PCV_ROW_FPS, R_BLUR = PCV_ROW_BLUR, R_CROSSHAIR = PCV_ROW_CROSSHAIR,
+    R_HITMARKERS = PCV_ROW_HITMARKERS, R_RESET = PCV_ROW_RESET,
     R_DONE = PCV_ROW_DONE, R_COUNT = PCV_ROW_COUNT
 };
 enum { A_UP, A_DOWN, A_LEFT, A_RIGHT, A_ACCEPT, A_BACK, A_OPEN };
@@ -190,6 +192,10 @@ int pc_video_menu_row_change(int row, int dir)
         break;
     case R_BLUR:
         s.motion_blur_off = !s.motion_blur_off; break;
+    case R_CROSSHAIR:
+        s.crosshair = wrap((int)s.crosshair + dir, PCX_STYLE_COUNT); break;
+    case R_HITMARKERS:
+        s.hitmarkers = !s.hitmarkers; break;
     default: return 0;
     }
     return pc_video_set(&s);
@@ -506,13 +512,13 @@ static int text_width(HFONT font, const wchar_t *text)
 static const char *const k_row_label[R_COUNT] = {
     "WINDOW MODE", "WINDOW SIZE", "INTERNAL RESOLUTION", "ANTI-ALIASING", "ANISOTROPIC FILTERING", "DEPTH OF FIELD",
     "SHARPENING", "AO METHOD", "AO QUALITY", "REFLECTIONS", "RAY TRACING (EXPERIMENTAL)", "ASPECT RATIO", "FIELD OF VIEW", "SCALING", "SCALING FILTER", "VSYNC", "FRAME RATE LIMIT",
-    "MOTION BLUR", "RESET TO DEFAULTS", "DONE"
+    "MOTION BLUR", "CROSSHAIR", "HIT MARKERS", "RESET TO DEFAULTS", "DONE"
 };
 
 static const char *const k_row_label_pt[R_COUNT] = {
     "MODO DE JANELA", "RESOLUÇÃO", "RESOLUÇÃO INTERNA", "SUAVIZAÇÃO DE SERRILHADO", "FILTRAGEM ANISOTRÓPICA", "PROFUNDIDADE DE CAMPO",
     "NITIDEZ", "MÉTODO DE OCLUSÃO", "QUALIDADE DA OCLUSÃO", "REFLEXOS", "RAY TRACING (EXPERIMENTAL)", "PROPORÇÃO", "FOV", "ESCALA DA IMAGEM", "FILTRO DE ESCALA", "SINCRONIZAÇÃO VERTICAL", "LIMITE DE QUADROS",
-    "DESFOQUE DE MOVIMENTO", "RESTAURAR PADRÕES", "CONCLUÍDO"
+    "DESFOQUE DE MOVIMENTO", "MIRA", "MARCADORES DE ACERTO", "RESTAURAR PADRÕES", "CONCLUÍDO"
 };
 
 static int video_menu_portuguese(void)
@@ -530,7 +536,8 @@ static const char *localized_video_value(const char *value)
         { "SSAO CLASSIC", "SSAO CLÁSSICO" }, { "ORIGINAL", "ORIGINAL" },
         { "STRETCH", "ESTICAR" }, { "INTEGER", "INTEIRA" }, { "FIT", "AJUSTAR" },
         { "NEAREST", "VIZINHO PRÓXIMO" }, { "LINEAR", "LINEAR" }, { "UNLIMITED", "ILIMITADO" },
-        { "32:9", "SUPER ULTRA-WIDE (32:9)" }, { "UNAVAILABLE", "INDISPONÍVEL" }
+        { "32:9", "SUPER ULTRA-WIDE (32:9)" }, { "UNAVAILABLE", "INDISPONÍVEL" },
+        { "CROSS", "CRUZ" }, { "T-SHAPE", "EM T" }, { "CIRCLE", "CÍRCULO" }
     };
     int i;
     for (i = 0; i < (int)(sizeof(words) / sizeof(words[0])); ++i)
@@ -609,6 +616,10 @@ size_t pc_video_menu_row_value(int row, char *out, size_t cap)
         if (s->fps_limit) snprintf(value, sizeof(value), "%u FPS", s->fps_limit); else strcpy(value, "UNLIMITED");
         break;
     case R_BLUR: strcpy(value, s->motion_blur_off ? "OFF" : "ORIGINAL"); break;
+    case R_CROSSHAIR:
+        strcpy(value, s->crosshair == PCX_CROSS ? "CROSS" : s->crosshair == PCX_T ? "T-SHAPE" : s->crosshair == PCX_CIRCLE ? "CIRCLE" : "ORIGINAL");
+        break;
+    case R_HITMARKERS: strcpy(value, s->hitmarkers ? "ON" : "OFF"); break;
     default: break;
     }
     if (video_menu_portuguese()) {
@@ -670,6 +681,10 @@ const char *pc_video_menu_row_help(int row)
     case R_VSYNC: return video_menu_text("Waits for the display to refresh before showing a frame.", "Aguarda a atualização da tela antes de exibir cada quadro.");
     case R_FPS: return video_menu_text("Caps how often the picture is shown.", "Limita a frequência de exibição da imagem.");
     case R_BLUR: return video_menu_text("The game's own camera motion blur.", "Desfoque de movimento original da câmera do jogo.");
+    case R_CROSSHAIR: return video_menu_text("A crosshair around the game's dot that opens as you move and fire. Original keeps the dot alone.",
+                                             "Uma mira em volta do ponto do jogo que se abre ao se mover e atirar. Original mantém só o ponto.");
+    case R_HITMARKERS: return video_menu_text("A mark on the crosshair when a shot of yours kills an enemy.",
+                                              "Uma marca na mira quando um tiro seu mata um inimigo.");
     case R_RESET: return video_menu_text("Restores every video setting to its default. Locked settings keep their values.", "Restaura as configurações de vídeo para os valores padrão. Opções fixadas mantêm seus valores.");
     case R_DONE: return video_menu_text("Back to the Options page.", "Volta à página de opções.");
     default: return "";
@@ -710,7 +725,8 @@ static unsigned row_lock_bit(int row)
     case R_REFLECTIONS: return PCV_LOCK_REFLECTIONS; case R_RAY_TRACING: return PCV_LOCK_RAY_TRACING;
     case R_ASPECT: return PCV_LOCK_ASPECT; case R_FOV: return PCV_LOCK_FOV; case R_SCALE: return PCV_LOCK_SCALE;
     case R_FILTER: return PCV_LOCK_FILTER; case R_VSYNC: return PCV_LOCK_VSYNC; case R_FPS: return PCV_LOCK_FPS;
-    case R_BLUR: return PCV_LOCK_BLUR; default: return 0;
+    case R_BLUR: return PCV_LOCK_BLUR; case R_CROSSHAIR: return PCV_LOCK_CROSSHAIR; case R_HITMARKERS: return PCV_LOCK_HITMARKERS;
+    default: return 0;
     }
 }
 
