@@ -24,6 +24,7 @@
 #include "kelvin_int.h"
 #include "../../video/fb_present.h"
 #include "../../video/pc_video.h"
+#include "../../video/pc_crosshair.h"
 
 #include "kelvin_gpu_hlsl.inc"
 
@@ -54,6 +55,7 @@ typedef struct VSG {
     float fog[4];
     uint32_t flags[4];
     float vm[4];                 /* x: viewmodel scale about the viewport centre (1 for none) */
+    float jit[4];                /* xy: this frame's DLAA offset, clip units per unit w (kelvin_gpu_dlss.inc) */
 } VSG;
 
 static volatile uint32_t s_vm_hash[8];
@@ -257,6 +259,8 @@ static uint64_t s_surf_gen;              /* bumped when a surface is created or 
 static void kg_bound_reset(void);        /* the draw path's record of the context's bindings is stale */
 static void kg_cache_invalidate(void);   /* ... and so is what it derived from surfaces, states and textures */
 static void kg_post_poll(void);          /* the picture settings (kelvin_gpu_post.inc) */
+static bool kg_dlss_run(struct KGpuSurf *cs, struct KGpuSurf *zs);   /* DLAA (kelvin_gpu_dlss.inc) */
+static void kg_dlss_after_flip(void);
 static void kgq_start(void);
 static bool kgq_enabled(void);
 static void kgq_report(void);
@@ -390,7 +394,7 @@ static const char kgpu_hlsl_clear[] =
 static volatile LONG64 s_pending_size;      /* raster width, raster height, output width, output height: 16 bits each */
 static void kgpu_request_host_size(unsigned int w, unsigned int h, unsigned int ow, unsigned int oh)
 {
-    if (w < 640 || h < 480 || w > 8192 || h > 8192 || (uint64_t)w * h > 16777216u || ow < 640 || oh < 480 || ow > w || oh > h) return;
+    if (w < 640 || h < 480 || w > 8192 || h > 8192 || (uint64_t)w * h > 16777216u || ow < 640 || oh < 480 || ow > 2 * w || oh > 2 * h) return;
     InterlockedExchange64(&s_pending_size, ((LONG64)w << 48) | ((LONG64)h << 32) | ((LONG64)ow << 16) | (LONG64)oh);
 }
 
@@ -437,7 +441,8 @@ bool kgpu_init(void)
         pc_video_raster_size(&rw, &rh);
         pc_video_render_size(&ow, &oh);
         G.host_w = rw; G.host_h = rh;
-        G.out_w = ow < rw ? ow : rw; G.out_h = oh < rh ? oh : rh;
+        /* smaller under SSAA; larger under the DLSS modes, which bring the world up to it (kelvin_gpu_dlss.inc) */
+        G.out_w = ow < 2 * rw ? ow : 2 * rw; G.out_h = oh < 2 * rh ? oh : 2 * rh;
     }
     if (G.host_w < 640 || G.host_h < 480 || G.host_w > 8192 || G.host_h > 8192) {
         G.host_w = 640; G.host_h = 480;
@@ -545,7 +550,7 @@ bool kgpu_init(void)
         !make_buffer((UINT)(G.ib_cap * 4), D3D11_BIND_INDEX_BUFFER, &G.ib)) return false;
     G.arena_cap = (size_t)4 * 1024 * 1024;        /* float4s: 64 MiB of raw vertex data */
     if (!make_buffer((UINT)(G.arena_cap * 16), D3D11_BIND_SHADER_RESOURCE, &G.arena) ||
-        !make_buffer(64, D3D11_BIND_CONSTANT_BUFFER, &G.cb_gvs) ||
+        !make_buffer(sizeof(VSG), D3D11_BIND_CONSTANT_BUFFER, &G.cb_gvs) ||
         !make_buffer(192 * 16, D3D11_BIND_CONSTANT_BUFFER, &G.cb_c) ||
         !make_buffer(32 * 16, D3D11_BIND_CONSTANT_BUFFER, &G.cb_a)) return false;
     {
@@ -1505,6 +1510,7 @@ static void write_bmp(const char *path, const uint8_t *bgra, unsigned int w, uns
 #include "kelvin_gpu_ssr.inc"
 #include "kelvin_gpu_draw.inc"
 #include "kelvin_gpu_rt.inc"
+#include "kelvin_gpu_dlss.inc"
 
 /* ---- clears ------------------------------------------------------------------------------------- */
 

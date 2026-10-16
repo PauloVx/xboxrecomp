@@ -349,7 +349,7 @@ static int photo_row_named(const char *name)
 static int video_row_named(const char *name)
 {
     static const char *const names[] = { "mode", "window", "internal", "aa", "af", "dof", "sharpen", "ao_method", "ao_quality", "reflections",
-        "ray_tracing", "aspect", "fov", "scale", "filter", "vsync", "fps", "blur" };
+        "ray_tracing", "aspect", "fov", "scale", "filter", "vsync", "fps", "blur", "crosshair", "hitmarkers" };
     int i;
     for (i = 0; i < (int)(sizeof(names) / sizeof(names[0])); i++) if (!_stricmp(name, names[i])) return i;
     return -1;
@@ -1433,6 +1433,8 @@ static const char *localized_video_literal(const char *text)
           "RAYTRACING (EXPERIMENTELL)", "RAY TRACING (SPERIMENTALE)" },
         { "FIELD OF VIEW", "FOV", "CAMPO DE VISIÓN", "CHAMP DE VISION", "SICHTFELD", "CAMPO VISIVO" },
         { "MOTION BLUR", "DESFOQUE DE MOVIMENTO", "DESENFOQUE DE MOVIMIENTO", "FLOU DE MOUVEMENT", "BEWEGUNGSUNSCHÄRFE", "MOSSO DI MOVIMENTO" },
+        { "CROSSHAIR", "MIRA", "PUNTO DE MIRA", "RÉTICULE", "FADENKREUZ", "MIRINO" },
+        { "HIT MARKERS", "MARCADORES DE ACERTO", "MARCADORES DE IMPACTO", "MARQUEURS D’IMPACT", "TREFFERMARKER", "INDICATORI DI COLPO" },
         /* photo mode (Portuguese reviewed; the others machine drafts, like the launcher's) */
         { "PHOTO MODE", "MODO FOTO", "MODO FOTO", "MODE PHOTO", "FOTOMODUS", "MODALITÀ FOTO" },
         { "WEAPON", "ARMA", "ARMA", "ARME", "WAFFE", "ARMA" },

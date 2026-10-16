@@ -746,6 +746,7 @@ static void kg_post_scene(KGpuSurf *cs, KGpuSurf *zs)
 {
     float taps, radius, depth_scale = 140.0f;
     long long now = qpc_now();
+    bool dlaa, upscale, upscaled = false;
     s_post.done = true;
     if (!s_post.scene_fx || !cs || cs->bpp != 4 || cs->dxfmt != DXGI_FORMAT_B8G8R8A8_UNORM || !post_init() ||
         !post_scene_resources(cs->hw, cs->hh)) return;
@@ -761,6 +762,8 @@ static void kg_post_scene(KGpuSurf *cs, KGpuSurf *zs)
     }
     kg_post_ao_scene(cs, zs);
     kg_ssr_pass(cs, zs);
+    dlaa = s_post.aa == PCV_AA_DLAA && kg_dlss_run(cs, zs);
+    upscale = s_post.aa >= PCV_AA_DLSS_QUALITY && s_post.aa <= PCV_AA_DLSS_PERFORMANCE;
     if (s_post.dof && (!zs || !zs->depth || !zs->real || !zs->srv || zs->hw != cs->hw || zs->hh != cs->hh)) {
         if (s_post.post_trace && !s_post.focus_skipped)
             fprintf(stderr, "[KPOST] frame %llu autofocus skipped: depth present=%d depth=%d real=%d sampleable=%d size=%ux%u scene=%ux%u\n",
@@ -794,12 +797,13 @@ static void kg_post_scene(KGpuSurf *cs, KGpuSurf *zs)
             s_post.focus_trace_qpc = now;
         }
     }
-    if (s_post.aa == PCV_AA_FXAA) {
+    if (upscale) upscaled = kg_dlss_run(cs, zs);   /* the frame is now the internal resolution: cs was swapped */
+    if (s_post.aa == PCV_AA_FXAA || (s_post.aa == PCV_AA_DLAA && !dlaa) || (upscale && !upscaled)) {   /* no DLSS: FXAA */
         ID3D11DeviceContext_CopyResource(G.ctx, (ID3D11Resource *)s_post.copy, (ID3D11Resource *)cs->tex);
         post_cb((float)cs->hw, (float)cs->hh, 0, 0, 0, 0, 0, 0, 0, 1.0f, 1.0f);
         post_pass(s_post.ps_fxaa, cs->rtv, cs->hw, cs->hh, s_post.copy_srv, NULL, NULL, NULL);
     }
-    if (s_post.sharpen) {
+    if (s_post.sharpen && !upscaled) {
         ID3D11DeviceContext_CopyResource(G.ctx, (ID3D11Resource *)s_post.copy, (ID3D11Resource *)cs->tex);
         post_cb((float)cs->hw, (float)cs->hh, 0, 0, 0, 0, 0, 0, s_post.sharpen == 1 ? 0.25f : s_post.sharpen == 2 ? 0.55f : 0.9f, 1.0f, 1.0f);
         post_pass(s_post.ps_sharp, cs->rtv, cs->hw, cs->hh, s_post.copy_srv, NULL, NULL, NULL);
@@ -868,7 +872,7 @@ static void kg_post_poll(void)
     s_post.aa = (int)v.aa; s_post.dof = (int)v.dof; s_post.sharpen = (int)v.sharpen;
     s_post.ao_method = (int)v.ao_method; s_post.ao_quality = (int)v.ao_quality;
     s_ssr_setting = v.reflections < PCV_REFL_COUNT ? (int)v.reflections : PCV_REFL_HIGH;
-    s_post.scene_fx = s_post.ao_method != PCV_AO_OFF || s_post.aa == PCV_AA_FXAA || s_post.dof || s_post.sharpen || s_post.depth_stats > 0 ||
+    s_post.scene_fx = s_post.ao_method != PCV_AO_OFF || s_post.aa == PCV_AA_FXAA || s_post.aa >= PCV_AA_DLAA || s_post.dof || s_post.sharpen || s_post.depth_stats > 0 ||
                       s_ssr_setting > 0;
     if ((int)v.af != s_af) {
         unsigned int i;
@@ -893,6 +897,7 @@ static void kg_post_before_flip(const KelvinTarget *t, unsigned int color_format
 static void kg_post_after_flip(void)
 {
     kg_ssr_after_flip();
+    kg_dlss_after_flip();
     s_post.world = 0;
     s_post.ao_camera = 0;
     s_post.ao_done = false;

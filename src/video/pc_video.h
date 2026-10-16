@@ -33,8 +33,12 @@ extern "C" {
 enum { PCV_ASPECT_ORIGINAL, PCV_ASPECT_4_3, PCV_ASPECT_16_9, PCV_ASPECT_21_9, PCV_ASPECT_32_9, PCV_ASPECT_COUNT };
 enum { PCV_SCALE_FIT, PCV_SCALE_STRETCH, PCV_SCALE_INTEGER };
 /* Anti-aliasing: FXAA filters the finished scene (before the HUD); SSAA renders at twice the width and height and
- * resolves back to the internal resolution. Depth of field and sharpening have four steps: off, low, medium, high. */
-enum { PCV_AA_OFF, PCV_AA_FXAA, PCV_AA_SSAA, PCV_AA_COUNT };
+ * resolves back to the internal resolution. DLAA is NVIDIA DLSS at the internal resolution (FXAA where it cannot run);
+ * the DLSS modes rasterise the world smaller (2/3, 0.58 or half the width and height, never under 640 x 480) and DLSS
+ * brings it up to the internal resolution before the HUD.
+ * Depth of field and sharpening have four steps: off, low, medium, high. */
+enum { PCV_AA_OFF, PCV_AA_FXAA, PCV_AA_SSAA, PCV_AA_DLAA, PCV_AA_DLSS_QUALITY, PCV_AA_DLSS_BALANCED, PCV_AA_DLSS_PERFORMANCE,
+       PCV_AA_COUNT };
 enum { PCV_STEP_OFF, PCV_STEP_LOW, PCV_STEP_MEDIUM, PCV_STEP_HIGH, PCV_STEP_COUNT };
 /* Ambient occlusion is a scene-depth effect applied before the HUD. Quality controls sampling
  * density and radius; the AO mask and its depth-aware blur stay at the scene resolution. */
@@ -63,6 +67,8 @@ typedef struct PcVideoSettings {
     unsigned ao_quality;                      /* ambient occlusion sampling, PCV_AOQ_* */
     unsigned reflections;                     /* PCV_REFL_* */
     unsigned ray_tracing;                     /* 1 = ray-traced effects (experimental), see pc_video_rt_support */
+    unsigned crosshair;                       /* PCX_* (pc_crosshair.h): ORIGINAL is the game's own dot alone */
+    unsigned hitmarkers;                      /* 1 = a marker when the player kills (pc_crosshair.h) */
     unsigned render_override_w, render_override_h; /* both non-zero: an explicit raster size (RECOMP_RENDER_*) */
 } PcVideoSettings;
 
@@ -73,7 +79,7 @@ enum {
     PCV_LOCK_FPS = 1u << 6, PCV_LOCK_ASPECT = 1u << 7, PCV_LOCK_FOV = 1u << 8, PCV_LOCK_BLUR = 1u << 9,
     PCV_LOCK_AA = 1u << 10, PCV_LOCK_AF = 1u << 11, PCV_LOCK_DOF = 1u << 12, PCV_LOCK_SHARPEN = 1u << 13,
     PCV_LOCK_AO_METHOD = 1u << 14, PCV_LOCK_AO_QUALITY = 1u << 15, PCV_LOCK_REFLECTIONS = 1u << 16,
-    PCV_LOCK_RAY_TRACING = 1u << 17
+    PCV_LOCK_RAY_TRACING = 1u << 17, PCV_LOCK_CROSSHAIR = 1u << 18, PCV_LOCK_HITMARKERS = 1u << 19
 };
 
 extern const unsigned pc_video_internal_heights[];   /* 480 .. 2160 */

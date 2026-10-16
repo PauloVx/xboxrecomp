@@ -9,6 +9,7 @@
 #include "pc_menu.h"
 #include "pc_movie_skip.h"
 #include "pc_photo.h"
+#include "pc_crosshair.h"
 #if defined(_WIN32)
 #define COBJMACROS
 #include <windows.h>
@@ -47,6 +48,8 @@ typedef struct FbGpu {
     ID3D11PixelShader *ovl_ps; ID3D11BlendState *ovl_blend;
     ID3D11Texture2D *ovl_tex; ID3D11ShaderResourceView *ovl_view;
     unsigned ovl_w, ovl_h; int overlay_on;
+    /* the crosshair and hit markers (pc_crosshair.h) */
+    ID3D11PixelShader *xh_ps; ID3D11Buffer *xh_cb;
 } FbGpu;
 /* Test-only observers compile away in the runtime. The device fixture reads
  * the actual backbuffer before flip; it does not replace rendering behavior. */
@@ -598,6 +601,7 @@ static void fb_gpu_close(FbGpu *g)
     { unsigned i; for (i = 0; i < FB_GPU_SLOTS; ++i) { FB_RELEASE(g->shared_srv[i]); FB_RELEASE(g->shared_tex[i]); } }
     FB_RELEASE(g->frame_fence); FB_RELEASE(g->done_fence); FB_RELEASE(g->ctx4);
     FB_RELEASE(g->ovl_view); FB_RELEASE(g->ovl_tex); FB_RELEASE(g->ovl_blend); FB_RELEASE(g->ovl_ps);
+    FB_RELEASE(g->xh_ps); FB_RELEASE(g->xh_cb);
     FB_RELEASE(g->ramp_view); FB_RELEASE(g->ramp_tex);
     FB_RELEASE(g->raster); FB_RELEASE(g->point); FB_RELEASE(g->linear); FB_RELEASE(g->ps); FB_RELEASE(g->vs); FB_RELEASE(g->vs_cinematic);
     FB_RELEASE(g->view); FB_RELEASE(g->texture); FB_RELEASE(g->target); FB_RELEASE(g->swap);
@@ -628,10 +632,20 @@ static HRESULT fb_gpu_open(FbGpu *g, HWND hwnd)
         "float4 ps(V v):SV_Target{float3 c=saturate(image.Sample(filter,v.uv).rgb)*(255.0/256)+0.5/256;"
         "return float4(ramp.SampleLevel(smooth,float2(c.r,0.5),0).r,ramp.SampleLevel(smooth,float2(c.g,0.5),0).g,"
         "ramp.SampleLevel(smooth,float2(c.b,0.5),0).b,1);}"
-        "float4 ps_ovl(V v):SV_Target{return image.Sample(filter,v.uv);}";
+        "float4 ps_ovl(V v):SV_Target{return image.Sample(filter,v.uv);}"
+        "cbuffer X:register(b0){float4 xc;float4 xl;float4 xm;};"
+        "float sg(float2 p,float2 a,float2 b){float2 pa=p-a,ba=b-a;return length(pa-ba*saturate(dot(pa,ba)/dot(ba,ba)));}"
+        "float4 ink(float d,float t,float px,float3 c,float a){float l=1-smoothstep(t-px,t+px,d);float o=1-smoothstep(t+px,t+3*px,d);return float4(c*l*a,max(l,o*0.7)*a);}"
+        "float4 ps_xh(V v):SV_Target{float2 p=(v.p.xy-xc.xy)/xc.z;float px=0.5/xc.z;float g=xl.x,l=xl.y,t=xl.z*0.5;"
+        "float d=1e4;if(xc.w<2.5){d=min(d,sg(p,float2(g,0),float2(g+l,0)));d=min(d,sg(p,float2(-g,0),float2(-g-l,0)));"
+        "d=min(d,sg(p,float2(0,g),float2(0,g+l)));if(xc.w<1.5)d=min(d,sg(p,float2(0,-g),float2(0,-g-l)));}"
+        "else d=abs(length(p)-g-2);"
+        "float4 c=ink(d,t,px,float3(1,1,1),xl.w);float2 q=abs(p);"
+        "float4 m=ink(sg(q,xm.yy*0.7071,xm.zz*0.7071),t*1.15,px,xm.w>0.5?float3(1,0.16,0.12):float3(1,1,1),xm.x);"
+        "return m+c*(1-m.a);}";
     IDXGIDevice *dxgi_device = NULL; IDXGIAdapter *adapter = NULL;
     IDXGIFactory2 *factory = NULL; IDXGIFactory5 *factory5 = NULL;
-    ID3DBlob *vs = NULL, *vs_cinematic = NULL, *ps = NULL, *ps_ovl = NULL, *errors = NULL; D3D_FEATURE_LEVEL level;
+    ID3DBlob *vs = NULL, *vs_cinematic = NULL, *ps = NULL, *ps_ovl = NULL, *ps_xh = NULL, *errors = NULL; D3D_FEATURE_LEVEL level;
     D3D11_BLEND_DESC blend = {0};
     DXGI_SWAP_CHAIN_DESC1 swap = {0}; D3D11_SAMPLER_DESC sampler = {0};
     D3D11_RASTERIZER_DESC raster = {0}; RECT client; HRESULT hr; BOOL tearing = FALSE;
@@ -674,6 +688,14 @@ static HRESULT fb_gpu_open(FbGpu *g, HWND hwnd)
         "ps_ovl", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &ps_ovl, &errors)); FB_RELEASE(errors);
     FB_TRY(ID3D11Device_CreatePixelShader(g->device, ps_ovl->lpVtbl->GetBufferPointer(ps_ovl),
         ps_ovl->lpVtbl->GetBufferSize(ps_ovl), NULL, &g->ovl_ps));
+    if (SUCCEEDED(D3DCompile(shader, sizeof(shader) - 1, "framebuffer-present", NULL, NULL,
+            "ps_xh", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &ps_xh, NULL))) {
+        D3D11_BUFFER_DESC cb = {0};
+        cb.ByteWidth = 48; cb.Usage = D3D11_USAGE_DEFAULT; cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        if (FAILED(ID3D11Device_CreatePixelShader(g->device, ps_xh->lpVtbl->GetBufferPointer(ps_xh),
+                ps_xh->lpVtbl->GetBufferSize(ps_xh), NULL, &g->xh_ps)) ||
+            FAILED(ID3D11Device_CreateBuffer(g->device, &cb, NULL, &g->xh_cb))) { FB_RELEASE(g->xh_ps); FB_RELEASE(g->xh_cb); }
+    }
     blend.RenderTarget[0].BlendEnable = TRUE;
     blend.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE; blend.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
     blend.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
@@ -705,7 +727,7 @@ static HRESULT fb_gpu_open(FbGpu *g, HWND hwnd)
     }
 done:
     if (FAILED(hr) && errors) fprintf(stderr, "[FBWIN] shader: %s\n", (char *)errors->lpVtbl->GetBufferPointer(errors));
-    FB_RELEASE(errors); FB_RELEASE(ps_ovl); FB_RELEASE(ps); FB_RELEASE(vs); FB_RELEASE(vs_cinematic); FB_RELEASE(factory5); FB_RELEASE(factory);
+    FB_RELEASE(errors); FB_RELEASE(ps_ovl); FB_RELEASE(ps_xh); FB_RELEASE(ps); FB_RELEASE(vs); FB_RELEASE(vs_cinematic); FB_RELEASE(factory5); FB_RELEASE(factory);
     FB_RELEASE(adapter); FB_RELEASE(dxgi_device); return hr;
 }
 /* RECOMP_FB_DUMP: write what the presenter is about to show (a GPU frame has no CPU copy). */
@@ -797,6 +819,31 @@ static void fb_overlay_upload(FbGpu *g, const uint32_t *pixels, unsigned width, 
     }
     ID3D11DeviceContext_UpdateSubresource(g->context, (ID3D11Resource *)g->ovl_tex, 0, NULL, pixels, width * 4, 0);
 }
+/* The crosshair and hit markers over the picture's centre, in pixels of a 1080-line picture scaled to it; not while a
+ * native menu covers the game. */
+static void fb_crosshair_draw(FbGpu *g, const FbPresentRect *r)
+{
+    PcCrosshairDraw x;
+    float constants[12];
+    D3D11_VIEWPORT viewport;
+    const FLOAT factor[4] = {0, 0, 0, 0};
+    if (!g->xh_ps || !g->xh_cb || !g->ovl_blend || pc_menu_active() || pc_photo_active() || !pc_crosshair_frame(&x)) return;
+    constants[0] = (float)r->x + (float)r->width * 0.5f; constants[1] = (float)r->y + (float)r->height * 0.5f;
+    constants[2] = (float)r->height / 1080.0f; constants[3] = (float)x.style;
+    constants[4] = x.gap; constants[5] = x.length; constants[6] = x.thickness; constants[7] = x.alpha;
+    constants[8] = x.marker_alpha; constants[9] = x.marker_inner; constants[10] = x.marker_outer;
+    constants[11] = x.marker_kill ? 1.0f : 0.0f;
+    ID3D11DeviceContext_UpdateSubresource(g->context, (ID3D11Resource *)g->xh_cb, 0, NULL, constants, 0, 0);
+    viewport.TopLeftX = 0; viewport.TopLeftY = 0; viewport.Width = (FLOAT)g->width; viewport.Height = (FLOAT)g->height;
+    viewport.MinDepth = 0; viewport.MaxDepth = 1;
+    ID3D11DeviceContext_RSSetViewports(g->context, 1, &viewport);
+    ID3D11DeviceContext_VSSetShader(g->context, g->vs, NULL, 0);
+    ID3D11DeviceContext_OMSetBlendState(g->context, g->ovl_blend, factor, 0xFFFFFFFFu);
+    ID3D11DeviceContext_PSSetShader(g->context, g->xh_ps, NULL, 0);
+    ID3D11DeviceContext_PSSetConstantBuffers(g->context, 0, 1, &g->xh_cb);
+    ID3D11DeviceContext_Draw(g->context, 3, 0);
+    ID3D11DeviceContext_OMSetBlendState(g->context, NULL, factor, 0xFFFFFFFFu);
+}
 static HRESULT fb_gpu_draw(FbGpu *g, const FbFrame *frame)
 {
     D3D11_VIEWPORT viewport;
@@ -853,6 +900,7 @@ static HRESULT fb_gpu_draw(FbGpu *g, const FbFrame *frame)
     ID3D11DeviceContext_PSSetSamplers(g->context, 1, 1, &g->linear);
     ID3D11DeviceContext_PSSetShaderResources(g->context, 1, 1, &g->ramp_view);
     ID3D11DeviceContext_PSSetShaderResources(g->context, 0, 1, &view); ID3D11DeviceContext_Draw(g->context, 3, 0);
+    fb_crosshair_draw(g, &r);
     if (g->overlay_on && g->ovl_view && g->ovl_ps && g->ovl_blend) {
         const FLOAT factor[4] = {0, 0, 0, 0};
         ID3D11SamplerState *ovl_sampler = g->ovl_w == g->width && g->ovl_h == g->height ? g->point : g->linear;
