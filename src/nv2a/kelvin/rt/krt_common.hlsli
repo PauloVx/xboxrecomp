@@ -3,7 +3,8 @@ RaytracingAccelerationStructure scene : register(t0);
 ByteAddressBuffer pos : register(t1);
 ByteAddressBuffer uv : register(t2);                 // uv0.xy, uv1.xy a vertex
 ByteAddressBuffer col : register(t3);                // RGBA8 a vertex
-StructuredBuffer<uint4> draw_info : register(t4);    // by geometry index: first vertex, tex0, tex1, flags (KRT_*)
+StructuredBuffer<uint4> draw_info : register(t4);    // by draw (instance ID + geometry index): first vertex, tex0, tex1,
+                                                     // flags (KRT_*)
 Texture2D<float4> textures[4096] : register(t0, space1);
 SamplerState wrap : register(s0);
 
@@ -15,14 +16,20 @@ cbuffer Frame : register(b0)
     float4 vp0, vp1, vp3;       // the camera matrix's x, y and w rows
     float4 zp;                  // its z row as zp.x * (w row) + zp.y; the depth buffer's largest value (zp.z); the
                                 // diagnostic view (zp.w: 1 normals, 2 shaded, 3 calibration)
-    float4 misc;                // the frame's number
+    float4 misc;                // the frame's number, whether there is a last frame (y)
+    float4 light;               // towards the main light (xyz), the shadows' strength (w)
+    float4 prev_vp0, prev_vp1, prev_vp3; // last frame's camera matrix rows
+    float4 fx;                  // occlusion strength, its reach, bounce colour strength
 };
 
 // Brightness factors for shade (krt_calibrate.hlsl): one a texture index, then one a kind of lighting.
 RWByteAddressBuffer factors : register(u2);
 static const uint KRT_FACTOR_KIND = 4096u, KRT_FACTOR_KEYS = 4096u + 3u;
 
-static const uint KRT_TEX0 = 1u, KRT_TEX1 = 2u, KRT_TEX0_TEXELS = 4u, KRT_TEX1_TEXELS = 8u, KRT_ALPHA_TEST = 16u;
+static const uint KRT_TEX0 = 1u, KRT_TEX1 = 2u, KRT_TEX0_TEXELS = 4u, KRT_TEX1_TEXELS = 8u, KRT_ALPHA_TEST = 16u,
+                  KRT_DYNAMIC = 32u;
+// instance masks: the level, and what is drawn with a transform of its own
+static const uint KRT_STATIC_MASK = 1u, KRT_DYNAMIC_MASK = 2u;
 
 // The world position of window position pp (guest pixels) at distance w along the view direction; w = 0 is the eye.
 float3 world_at(float2 pp, float w)
@@ -153,35 +160,40 @@ bool alpha_passes(uint geometry, uint primitive, float2 bary)
     }
 }
 
+// geometry: the hit's draw (its instance's ID, where its group's draws start, plus its geometry index)
 struct Hit { bool found; float t; uint geometry, primitive; float2 bary; };
 
-// The nearest surface along a ray, cut-out surfaces tested as the game tests them.
-Hit first_hit(RayDesc r)
+// The nearest surface along a ray among the instances in mask, cut-out surfaces tested as the game tests them.
+Hit first_hit_in(RayDesc r, uint mask)
 {
     RayQuery<RAY_FLAG_NONE> q;
-    q.TraceRayInline(scene, RAY_FLAG_NONE, 0xFF, r);
+    q.TraceRayInline(scene, RAY_FLAG_NONE, mask, r);
     while (q.Proceed()) {
         if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE &&
-            alpha_passes(q.CandidateGeometryIndex(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics()))
+            alpha_passes(q.CandidateInstanceID() + q.CandidateGeometryIndex(), q.CandidatePrimitiveIndex(),
+                         q.CandidateTriangleBarycentrics()))
             q.CommitNonOpaqueTriangleHit();
     }
     Hit h;
     h.found = q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
     h.t = h.found ? q.CommittedRayT() : 0.0;
-    h.geometry = h.found ? q.CommittedGeometryIndex() : 0;
+    h.geometry = h.found ? q.CommittedInstanceID() + q.CommittedGeometryIndex() : 0;
     h.primitive = h.found ? q.CommittedPrimitiveIndex() : 0;
     h.bary = h.found ? q.CommittedTriangleBarycentrics() : 0.0;
     return h;
 }
 
-// Whether anything is between a point and a direction's end (shadow rays): the first hit ends the search.
-bool occluded(RayDesc r)
+Hit first_hit(RayDesc r) { return first_hit_in(r, 0xFF); }
+
+// Whether anything among the instances in mask is along a ray (shadow and occlusion rays): the first hit ends it.
+bool occluded(RayDesc r, uint mask)
 {
     RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
-    q.TraceRayInline(scene, RAY_FLAG_NONE, 0xFF, r);
+    q.TraceRayInline(scene, RAY_FLAG_NONE, mask, r);
     while (q.Proceed()) {
         if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE &&
-            alpha_passes(q.CandidateGeometryIndex(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics()))
+            alpha_passes(q.CandidateInstanceID() + q.CandidateGeometryIndex(), q.CandidatePrimitiveIndex(),
+                         q.CandidateTriangleBarycentrics()))
             q.CommitNonOpaqueTriangleHit();
     }
     return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;

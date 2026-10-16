@@ -24,6 +24,8 @@ typedef struct KrtCapDraw {
     uint32_t tex[2], tex_w[2], tex_h[2], tex_fmt[2];
     uint32_t vs, alpha_test;
     uint32_t rt_tex[2], rt_flags;       /* for the D3D12 side: texture indices and KRT_* flags */
+    bool sh;
+    float sh_l1[3];                     /* lit by ambient coefficients: their linear term, in the model's space */
     float m[16];                        /* the program's c[10..13] */
     bool raw_ok;
     float raw[3];                       /* the first vertex's input position, for the check */
@@ -47,15 +49,36 @@ static struct {
     ID3D11Texture2D *out;               /* what the D3D12 passes wrote, at the raster size */
     ID3D11Texture2D *in[3];             /* their inputs: the picture, the reflection weight and surface */
     HANDLE in_h[3];
+    ID3D11ShaderResourceView *pic_srv;  /* the picture copy, read back by the lighting composite */
+    ID3D11Texture2D *depth, *lit;       /* the depth buffer as R32F (written here), the lighting factor (by D3D12) */
+    ID3D11RenderTargetView *depth_rtv;
+    ID3D11ShaderResourceView *lit_srv;
+    HANDLE depth_h, lit_h;
+    ID3D11PixelShader *ps_depth, *ps_lit;
     ID3D11ShaderResourceView *out_srv;
     HANDLE out_h;
     unsigned out_w, out_hh;
     ID3D11PixelShader *ps_view;
-    int view;                           /* RECOMP_KGPU_RT_VIEW: 1 normals, 2 shaded, 3 calibration (diagnostic) */
+    int view;                           /* RECOMP_KGPU_RT_VIEW: 1 normals, 2 shaded, 3 calibration, 4 lighting (diagnostic) */
     unsigned calib;
+    float light[3];                     /* towards the main light, smoothed over frames */
+    bool have_light;
+    float shadow, ao, ao_radius, gi;    /* strengths (RECOMP_KGPU_RT_SHADOW/_AO/_GI, 0 off) */
     bool reflect;                       /* ray-traced reflections (RECOMP_KGPU_RT_REFL=0 turns them off) */
     uint32_t first[KRT_DRAWS_MAX], count[KRT_DRAWS_MAX], tex0[KRT_DRAWS_MAX], tex1[KRT_DRAWS_MAX], flags[KRT_DRAWS_MAX];
 } s_rtc;
+
+/* The depth buffer copied as plain floats for D3D12; the picture multiplied by the lighting factor. */
+static const char kg_rtc_depth_hlsl[] =
+    "Texture2D<float4> z : register(t0);\n"
+    "float main(float4 p : SV_Position) : SV_Target { return z.Load(int3(p.xy, 0)).r; }\n";
+static const char kg_rtc_lit_hlsl[] =
+    "Texture2D<float4> pic : register(t0);\n"
+    "Texture2D<float4> lit : register(t1);\n"
+    "float4 main(float4 p : SV_Position) : SV_Target {\n"
+    "    float4 c = pic.Load(int3(p.xy, 0));\n"
+    "    return float4(c.rgb * lit.Load(int3(p.xy, 0)).rgb, c.a);\n"
+    "}\n";
 
 static const char kg_rtc_view_hlsl[] =
     "Texture2D<float4> rt : register(t0);\n"
@@ -138,11 +161,28 @@ static bool kg_rtc_setup(void)
     s_rtc.check = e && *e && *e != '0';
     e = getenv("RECOMP_KGPU_RT_VIEW");
     s_rtc.view = e && *e ? atoi(e) : 0;
+    e = getenv("RECOMP_KGPU_RT_SHADOW");
+    s_rtc.shadow = e && *e ? (float)atof(e) : 0.55f;
+    e = getenv("RECOMP_KGPU_RT_AO");
+    s_rtc.ao = e && *e ? (float)atof(e) : 0.6f;
+    s_rtc.ao_radius = 1.5f;
+    e = getenv("RECOMP_KGPU_RT_GI");
+    s_rtc.gi = e && *e ? (float)atof(e) : 0.5f;
     e = getenv("RECOMP_KGPU_RT_REFL");
     s_rtc.reflect = !(e && *e == '0');
     code = compile_hlsl("", kg_rtc_view_hlsl, "main", "ps_5_0");
     if (code) {
         ID3D11Device_CreatePixelShader(G.dev, ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code), NULL, &s_rtc.ps_view);
+        ID3D10Blob_Release(code);
+    }
+    code = compile_hlsl("", kg_rtc_depth_hlsl, "main", "ps_5_0");
+    if (code) {
+        ID3D11Device_CreatePixelShader(G.dev, ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code), NULL, &s_rtc.ps_depth);
+        ID3D10Blob_Release(code);
+    }
+    code = compile_hlsl("", kg_rtc_lit_hlsl, "main", "ps_5_0");
+    if (code) {
+        ID3D11Device_CreatePixelShader(G.dev, ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code), NULL, &s_rtc.ps_lit);
         ID3D10Blob_Release(code);
     }
     fprintf(stderr, "[KRT] geometry capture on: up to %u vertices a frame\n", KRT_SO_VERTS);
@@ -204,6 +244,13 @@ static bool kg_rtc_begin(const KGpuDraw *d, const KgDc *dc, KGpuVs *ve, float zm
     }
     if (ps->alpha_test)
         r->rt_flags |= KRT_ALPHA_TEST | ((uint32_t)(ps->alpha_func & 7) << 8) | ((uint32_t)(ps->alpha_ref & 255) << 16);
+    if (!ve->rt_sh) {
+        /* a program lit by ambient coefficients reads the normal (v2) and c[2..5]; c[4] scales the normal's
+         * components, the coefficients' linear term (BLACK's props and characters) */
+        ve->rt_sh = ve->source && strstr(ve->source, "FetchAttr(2, vid)") && strstr(ve->source, "(C[4].xyz") &&
+                 strstr(ve->source, "(C[5].xyz") ? 2 : 1;
+    }
+    if (ve->rt_sh == 2) { r->sh = true; memcpy(r->sh_l1, c + 4 * 4, sizeof(r->sh_l1)); }
     memcpy(r->m, c + 4 * 10, sizeof(r->m));
     {
         const KGpuAttrSrc *a = &d->gvs->attr[0];
@@ -335,6 +382,9 @@ static void kg_rtc_free_textures(void)
     unsigned i;
     SAFE_RELEASE(s_rtc.out_srv); SAFE_RELEASE(s_rtc.out);
     for (i = 0; i < 3; i++) SAFE_RELEASE(s_rtc.in[i]);
+    SAFE_RELEASE(s_rtc.pic_srv); SAFE_RELEASE(s_rtc.depth_rtv); SAFE_RELEASE(s_rtc.depth); SAFE_RELEASE(s_rtc.lit_srv); SAFE_RELEASE(s_rtc.lit);
+    if (s_rtc.depth_h) { CloseHandle(s_rtc.depth_h); s_rtc.depth_h = NULL; }
+    if (s_rtc.lit_h) { CloseHandle(s_rtc.lit_h); s_rtc.lit_h = NULL; }
     if (s_rtc.out_h) { CloseHandle(s_rtc.out_h); s_rtc.out_h = NULL; }
     for (i = 0; i < 3; i++) if (s_rtc.in_h[i]) { CloseHandle(s_rtc.in_h[i]); s_rtc.in_h[i] = NULL; }
     s_rtc.out_w = s_rtc.out_hh = 0;
@@ -352,8 +402,13 @@ static bool kg_rtc_output(unsigned w, unsigned h)
     if (!kg_rtc_shared(w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_UNORDERED_ACCESS, &s_rtc.out, &s_rtc.out_srv, &s_rtc.out_h))
         goto fail;
     for (i = 0; i < 3; i++)
-        if (!kg_rtc_shared(w, h, in_fmt[i], 0, &s_rtc.in[i], NULL, &s_rtc.in_h[i])) goto fail;
-    if (!krt_set_output(s_rtc.out_h, w, h) || !krt_set_inputs(s_rtc.in_h[0], s_rtc.in_h[1], s_rtc.in_h[2])) goto fail;
+        if (!kg_rtc_shared(w, h, in_fmt[i], 0, &s_rtc.in[i], i ? NULL : &s_rtc.pic_srv, &s_rtc.in_h[i])) goto fail;
+    if (!kg_rtc_shared(w, h, DXGI_FORMAT_R32_FLOAT, D3D11_BIND_RENDER_TARGET, &s_rtc.depth, NULL, &s_rtc.depth_h) ||
+        FAILED(ID3D11Device_CreateRenderTargetView(G.dev, (ID3D11Resource *)s_rtc.depth, NULL, &s_rtc.depth_rtv)) ||
+        !kg_rtc_shared(w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_UNORDERED_ACCESS, &s_rtc.lit, &s_rtc.lit_srv, &s_rtc.lit_h))
+        goto fail;
+    if (!krt_set_output(s_rtc.out_h, w, h) ||
+        !krt_set_inputs(s_rtc.in_h[0], s_rtc.in_h[1], s_rtc.in_h[2], s_rtc.depth_h, s_rtc.lit_h)) goto fail;
     s_rtc.out_w = w; s_rtc.out_hh = h;
     return true;
 fail:
@@ -410,9 +465,71 @@ static void kg_rtc_calibration(void)
             n[2] ? ratios[2][n[2] / 2] : 0.0f, n[2]);
 }
 
+/* The inverse of a 4x4 matrix (rows), false if it has none. */
+static bool kg_rtc_inv4(const float *m, double *inv)
+{
+    double a[16], det;
+    int i;
+    for (i = 0; i < 16; i++) a[i] = m[i];
+    inv[0] = a[5]*a[10]*a[15] - a[5]*a[11]*a[14] - a[9]*a[6]*a[15] + a[9]*a[7]*a[14] + a[13]*a[6]*a[11] - a[13]*a[7]*a[10];
+    inv[4] = -a[4]*a[10]*a[15] + a[4]*a[11]*a[14] + a[8]*a[6]*a[15] - a[8]*a[7]*a[14] - a[12]*a[6]*a[11] + a[12]*a[7]*a[10];
+    inv[8] = a[4]*a[9]*a[15] - a[4]*a[11]*a[13] - a[8]*a[5]*a[15] + a[8]*a[7]*a[13] + a[12]*a[5]*a[11] - a[12]*a[7]*a[9];
+    inv[12] = -a[4]*a[9]*a[14] + a[4]*a[10]*a[13] + a[8]*a[5]*a[14] - a[8]*a[6]*a[13] - a[12]*a[5]*a[10] + a[12]*a[6]*a[9];
+    inv[1] = -a[1]*a[10]*a[15] + a[1]*a[11]*a[14] + a[9]*a[2]*a[15] - a[9]*a[3]*a[14] - a[13]*a[2]*a[11] + a[13]*a[3]*a[10];
+    inv[5] = a[0]*a[10]*a[15] - a[0]*a[11]*a[14] - a[8]*a[2]*a[15] + a[8]*a[3]*a[14] + a[12]*a[2]*a[11] - a[12]*a[3]*a[10];
+    inv[9] = -a[0]*a[9]*a[15] + a[0]*a[11]*a[13] + a[8]*a[1]*a[15] - a[8]*a[3]*a[13] - a[12]*a[1]*a[11] + a[12]*a[3]*a[9];
+    inv[13] = a[0]*a[9]*a[14] - a[0]*a[10]*a[13] - a[8]*a[1]*a[14] + a[8]*a[2]*a[13] + a[12]*a[1]*a[10] - a[12]*a[2]*a[9];
+    inv[2] = a[1]*a[6]*a[15] - a[1]*a[7]*a[14] - a[5]*a[2]*a[15] + a[5]*a[3]*a[14] + a[13]*a[2]*a[7] - a[13]*a[3]*a[6];
+    inv[6] = -a[0]*a[6]*a[15] + a[0]*a[7]*a[14] + a[4]*a[2]*a[15] - a[4]*a[3]*a[14] - a[12]*a[2]*a[7] + a[12]*a[3]*a[6];
+    inv[10] = a[0]*a[5]*a[15] - a[0]*a[7]*a[13] - a[4]*a[1]*a[15] + a[4]*a[3]*a[13] + a[12]*a[1]*a[7] - a[12]*a[3]*a[5];
+    inv[14] = -a[0]*a[5]*a[14] + a[0]*a[6]*a[13] + a[4]*a[1]*a[14] - a[4]*a[2]*a[13] - a[12]*a[1]*a[6] + a[12]*a[2]*a[5];
+    inv[3] = -a[1]*a[6]*a[11] + a[1]*a[7]*a[10] + a[5]*a[2]*a[11] - a[5]*a[3]*a[10] - a[9]*a[2]*a[7] + a[9]*a[3]*a[6];
+    inv[7] = a[0]*a[6]*a[11] - a[0]*a[7]*a[10] - a[4]*a[2]*a[11] + a[4]*a[3]*a[10] + a[8]*a[2]*a[7] - a[8]*a[3]*a[6];
+    inv[11] = -a[0]*a[5]*a[11] + a[0]*a[7]*a[9] + a[4]*a[1]*a[11] - a[4]*a[3]*a[9] - a[8]*a[1]*a[7] + a[8]*a[3]*a[5];
+    inv[15] = a[0]*a[5]*a[10] - a[0]*a[6]*a[9] - a[4]*a[1]*a[10] + a[4]*a[2]*a[9] + a[8]*a[1]*a[6] - a[8]*a[2]*a[5];
+    det = a[0]*inv[0] + a[1]*inv[4] + a[2]*inv[8] + a[3]*inv[12];
+    if (det == 0.0 || det != det) return false;
+    for (i = 0; i < 16; i++) inv[i] /= det;
+    return true;
+}
+
+/* The main light: BLACK bakes its lighting, but the ambient coefficients that light its props and characters have a
+ * linear term pointing at where most light comes from. Each such draw's, turned from its model's space into the
+ * world (the camera's inverse times its own matrix), summed and smoothed over frames. */
+static void kg_rtc_light(const float *vp)
+{
+    double ivp[16], sum[3] = { 0, 0, 0 }, len;
+    unsigned i, j, k;
+    if (!kg_rtc_inv4(vp, ivp)) return;
+    for (i = 0; i < s_rtc.ndraws; i++) {
+        const KrtCapDraw *r = &s_rtc.draws[i];
+        double w[9], d[3];
+        if (!r->sh) continue;
+        /* the model-to-world rotation: (camera^-1 * draw matrix), upper 3x3 */
+        for (j = 0; j < 3; j++)
+            for (k = 0; k < 3; k++)
+                w[j * 3 + k] = ivp[j * 4 + 0] * r->m[0 * 4 + k] + ivp[j * 4 + 1] * r->m[1 * 4 + k] +
+                               ivp[j * 4 + 2] * r->m[2 * 4 + k] + ivp[j * 4 + 3] * r->m[3 * 4 + k];
+        for (j = 0; j < 3; j++) d[j] = w[j * 3] * r->sh_l1[0] + w[j * 3 + 1] * r->sh_l1[1] + w[j * 3 + 2] * r->sh_l1[2];
+        for (j = 0; j < 3; j++) sum[j] += d[j];
+    }
+    len = sqrt(sum[0] * sum[0] + sum[1] * sum[1] + sum[2] * sum[2]);
+    if (len < 1e-6) return;
+    for (j = 0; j < 3; j++) sum[j] /= len;
+    if (!s_rtc.have_light) {
+        for (j = 0; j < 3; j++) s_rtc.light[j] = (float)sum[j];
+        s_rtc.have_light = true;
+        fprintf(stderr, "[KRT] main light towards %.2f %.2f %.2f\n", sum[0], sum[1], sum[2]);
+    } else {
+        for (j = 0; j < 3; j++) s_rtc.light[j] = s_rtc.light[j] * 0.97f + (float)sum[j] * 0.03f;
+        len = sqrt((double)s_rtc.light[0] * s_rtc.light[0] + (double)s_rtc.light[1] * s_rtc.light[1] + (double)s_rtc.light[2] * s_rtc.light[2]);
+        if (len > 1e-6) for (j = 0; j < 3; j++) s_rtc.light[j] = (float)(s_rtc.light[j] / len);
+    }
+}
+
 /* The frame's world is drawn (cs is the main target, or NULL at a flip): turn what was captured into world space,
  * hand it to the D3D12 side and run the passes there. */
-static void kg_rtc_finish(KGpuSurf *cs)
+static void kg_rtc_finish(KGpuSurf *cs, KGpuSurf *zs)
 {
     const float *vp;
     KrtCb cb;
@@ -449,6 +566,7 @@ static void kg_rtc_finish(KGpuSurf *cs)
         s_rtc.tex0[i] = s_rtc.draws[i].rt_tex[0];
         s_rtc.tex1[i] = s_rtc.draws[i].rt_tex[1];
         s_rtc.flags[i] = s_rtc.draws[i].rt_flags;
+        if (memcmp(s_rtc.draws[i].m, vp, sizeof(s_rtc.draws[i].m)) != 0) s_rtc.flags[i] |= KRT_DYNAMIC;
     }
     f.nverts = s_rtc.used; f.ndraws = s_rtc.ndraws;
     f.first = s_rtc.first; f.count = s_rtc.count; f.tex0 = s_rtc.tex0; f.tex1 = s_rtc.tex1; f.flags = s_rtc.flags;
@@ -456,16 +574,24 @@ static void kg_rtc_finish(KGpuSurf *cs)
     memcpy(f.c58, cb.c58, sizeof(f.c58));
     memcpy(f.c59, cb.c59, sizeof(f.c59));
     memcpy(f.vp, vp, sizeof(f.vp));
+    kg_rtc_light(vp);
+    f.light[0] = s_rtc.light[0]; f.light[1] = s_rtc.light[1]; f.light[2] = s_rtc.light[2];
+    f.light[3] = s_rtc.have_light ? s_rtc.shadow : 0.0f;
+    f.ao = s_rtc.ao; f.ao_radius = s_rtc.ao_radius; f.gi = s_rtc.gi;
     f.zmax = 1.0f / s_rtc.scale[2];
     f.guest_w = 2.0f / s_rtc.scale[0]; f.guest_h = 2.0f / s_rtc.scale[1];
     sized = cs && kg_rtc_output(cs->hw, cs->hh);
-    f.view = sized ? s_rtc.view : 0;
+    f.view = sized && s_rtc.view < 4 ? s_rtc.view : 0;    /* 4 is the lighting factor, shown here */
     /* reflections: when the env draws marked pixels this frame, at the picture's size and format */
     f.reflect = s_rtc.reflect && sized && s_ssr.used && s_ssr.w == cs->hw && s_ssr.h == cs->hh &&
                 cs->dxfmt == DXGI_FORMAT_B8G8R8A8_UNORM;
     /* the picture so far: the reflections read it, and shading learns its brightness from it */
     f.calibrate = sized && cs->dxfmt == DXGI_FORMAT_B8G8R8A8_UNORM;
     if (f.calibrate) ID3D11DeviceContext_CopyResource(G.ctx, (ID3D11Resource *)s_rtc.in[0], (ID3D11Resource *)cs->tex);
+    /* shadows, occlusion and bounce colour need the depth buffer, at the picture's size */
+    f.lighting = f.calibrate && zs && zs->depth && zs->srv && zs->hw == cs->hw && zs->hh == cs->hh && s_rtc.ps_depth &&
+                 s_rtc.ps_lit && (f.light[3] > 0.0f || f.ao > 0.0f || f.gi > 0.0f) && !f.view && post_init();
+    if (f.lighting) post_pass(s_rtc.ps_depth, s_rtc.depth_rtv, cs->hw, cs->hh, zs->srv, NULL, NULL, NULL);
     if (f.reflect) {
         ID3D11DeviceContext_CopyResource(G.ctx, (ID3D11Resource *)s_rtc.in[1], (ID3D11Resource *)s_ssr.tex[0]);
         ID3D11DeviceContext_CopyResource(G.ctx, (ID3D11Resource *)s_rtc.in[2], (ID3D11Resource *)s_ssr.tex[2]);
@@ -476,23 +602,30 @@ static void kg_rtc_finish(KGpuSurf *cs)
     } else if (f.view && s_rtc.ps_view && post_init()) {
         post_pass(s_rtc.ps_view, cs->rtv, cs->hw, cs->hh, s_rtc.out_srv, NULL, NULL, NULL);
         kg_cache_invalidate();
-    } else if (f.reflect) {
-        s_ssr.rt_srv = s_rtc.out_srv;
-        s_ssr.rt_valid = true;
+    } else {
+        if (f.lighting) {
+            if (s_rtc.view == 4) post_pass(s_rtc.ps_view, cs->rtv, cs->hw, cs->hh, s_rtc.lit_srv, NULL, NULL, NULL);
+            else post_pass(s_rtc.ps_lit, cs->rtv, cs->hw, cs->hh, s_rtc.pic_srv, s_rtc.lit_srv, NULL, NULL);
+            kg_cache_invalidate();
+        }
+        if (f.reflect) {
+            s_ssr.rt_srv = s_rtc.out_srv;
+            s_ssr.rt_valid = true;
+        }
     }
 }
 
 /* Called for every draw once its surfaces are known: the HUD's first draw ends the world. */
-static void kg_rtc_note_draw(const KPixelState *ps, const KGpuSurf *cs)
+static void kg_rtc_note_draw(const KPixelState *ps, const KGpuSurf *cs, KGpuSurf *zs)
 {
     if (s_rtc.state > 0 && !s_rtc.done && s_rtc.ndraws >= 4 && post_main_target(cs) &&
         ps->depth_test && ps->depth_func == 7 && !ps->depth_write)
-        kg_rtc_finish((KGpuSurf *)cs);
+        kg_rtc_finish((KGpuSurf *)cs, zs);
 }
 
 static void kg_rtc_before_flip(void)
 {
-    kg_rtc_finish(NULL);
+    kg_rtc_finish(NULL, NULL);
     s_rtc.used = 0;
     s_rtc.ndraws = 0;
     s_rtc.overflow = false;

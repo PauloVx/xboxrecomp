@@ -61,7 +61,7 @@ typedef struct KgDc {
 /* Ray tracing capture (kelvin_gpu_rt.inc, included after this file). */
 static bool kg_rtc_begin(const KGpuDraw *d, const KgDc *dc, KGpuVs *ve, float zmax);
 static void kg_rtc_end(void);
-static void kg_rtc_note_draw(const KPixelState *ps, const KGpuSurf *cs);
+static void kg_rtc_note_draw(const KPixelState *ps, const KGpuSurf *cs, KGpuSurf *zs);
 
 static KgBound s_bd;
 static KgDc s_dc;
@@ -436,7 +436,7 @@ static void kgpu_draw_now(const KGpuDraw *d)
         if (dc->reject == 1) G.skipped++;
         return;
     }
-    kg_rtc_note_draw(ps, dc->cs);
+    kg_rtc_note_draw(ps, dc->cs, dc->zs);
     kg_post_note_draw(ps, dc->cs, dc->zs);       /* the picture effects run when the HUD begins (kelvin_gpu_post.inc) */
     if (dc->zs) {
         if (ps->depth_write || ps->stencil_write) dc->zs->real = true;

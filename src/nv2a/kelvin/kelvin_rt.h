@@ -40,7 +40,8 @@ void krt_tex_remove(int index);
 enum {
     KRT_TEX0 = 1u, KRT_TEX1 = 2u,      /* textured on stage 0 (coordinates uv0) / stage 1 (uv1) */
     KRT_TEX0_TEXELS = 4u, KRT_TEX1_TEXELS = 8u, /* those coordinates count texels (a linear texture) */
-    KRT_ALPHA_TEST = 16u               /* alpha test: function in bits 8..10, reference in bits 16..23 */
+    KRT_ALPHA_TEST = 16u,              /* alpha test: function in bits 8..10, reference in bits 16..23 */
+    KRT_DYNAMIC = 32u                  /* drawn with a transform of its own (a character, a prop), not the level */
 };
 
 /* One frame's captured world: `nverts` vertices, three a triangle, in `ndraws` draws of `count[i]` vertices from
@@ -58,11 +59,15 @@ typedef struct KrtFrame {
     int view;                          /* RECOMP_KGPU_RT_VIEW: the camera's view traced into the output (1 normals, 2 shaded) */
     bool reflect;                      /* reflections for the pixels the screen-space targets marked */
     bool calibrate;                    /* the picture input holds this frame: learn shading brightness from it */
+    float light[4];                    /* towards the main light (xyz, world space) and the shadows' strength (w) */
+    float ao, ao_radius, gi;           /* occlusion strength and reach, bounce-colour strength (0 off) */
+    bool lighting;                     /* the depth input holds this frame: shadows, occlusion and bounce colour */
 } KrtFrame;
 
-/* The per-frame inputs of the reflections, made by D3D11 at the output's size and shared by NT handle: the picture
- * so far (BGRA8) and the screen-space reflection targets' weight (RGBA16F) and surface (RGBA32F). */
-bool krt_set_inputs(HANDLE picture, HANDLE weight, HANDLE surface);
+/* The passes' per-frame textures, made by D3D11 at the output's size and shared by NT handle: the picture so far
+ * (BGRA8), the screen-space reflection targets' weight (RGBA16F) and surface (RGBA32F), the depth buffer (R32F), and
+ * the lighting factor the lighting pass writes (RGBA16F, unordered access). */
+bool krt_set_inputs(HANDLE picture, HANDLE weight, HANDLE surface, HANDLE depth, HANDLE light);
 
 /* Called on the renderer's thread, after the D3D11 work that wrote the geometry texture has been issued. Builds the
  * scene's acceleration structure and runs the passes; D3D11 work issued afterwards waits for them. False if nothing
