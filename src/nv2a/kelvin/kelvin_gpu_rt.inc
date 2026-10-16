@@ -23,6 +23,7 @@ typedef struct KrtCapDraw {
     uint32_t first, count;              /* vertices in the stream */
     uint32_t tex[2], tex_w[2], tex_h[2], tex_fmt[2];
     uint32_t vs, alpha_test;
+    uint32_t rt_tex[2], rt_flags;       /* for the D3D12 side: texture indices and KRT_* flags */
     float m[16];                        /* the program's c[10..13] */
     bool raw_ok;
     float raw[3];                       /* the first vertex's input position, for the check */
@@ -50,15 +51,19 @@ static struct {
     HANDLE out_h;
     unsigned out_w, out_hh;
     ID3D11PixelShader *ps_view;
-    bool view;                          /* RECOMP_KGPU_RT_VIEW=1 */
+    int view;                           /* RECOMP_KGPU_RT_VIEW: 1 normals, 2 shaded, 3 calibration (diagnostic) */
+    unsigned calib;
     bool reflect;                       /* ray-traced reflections (RECOMP_KGPU_RT_REFL=0 turns them off) */
-    uint32_t first[KRT_DRAWS_MAX], count[KRT_DRAWS_MAX];
-    uint8_t opaque[KRT_DRAWS_MAX];
+    uint32_t first[KRT_DRAWS_MAX], count[KRT_DRAWS_MAX], tex0[KRT_DRAWS_MAX], tex1[KRT_DRAWS_MAX], flags[KRT_DRAWS_MAX];
 } s_rtc;
 
 static const char kg_rtc_view_hlsl[] =
     "Texture2D<float4> rt : register(t0);\n"
-    "float4 main(float4 p : SV_Position) : SV_Target { return float4(rt.Load(int3(p.xy, 0)).rgb, 1.0); }\n";
+    "float4 main(float4 p : SV_Position) : SV_Target {\n"
+    "    uint w, h; rt.GetDimensions(w, h);\n"
+    "    if (p.x > w * 0.5) discard;   // the left half: the picture stays on the right to compare\n"
+    "    return float4(rt.Load(int3(p.xy, 0)).rgb, 1.0);\n"
+    "}\n";
 
 static const char kg_rtc_hlsl[] =
     "ByteAddressBuffer so : register(t0);\n"
@@ -132,7 +137,7 @@ static bool kg_rtc_setup(void)
     e = getenv("RECOMP_KGPU_RT_CHECK");
     s_rtc.check = e && *e && *e != '0';
     e = getenv("RECOMP_KGPU_RT_VIEW");
-    s_rtc.view = e && *e && *e != '0';
+    s_rtc.view = e && *e ? atoi(e) : 0;
     e = getenv("RECOMP_KGPU_RT_REFL");
     s_rtc.reflect = !(e && *e == '0');
     code = compile_hlsl("", kg_rtc_view_hlsl, "main", "ps_5_0");
@@ -188,6 +193,17 @@ static bool kg_rtc_begin(const KGpuDraw *d, const KgDc *dc, KGpuVs *ve, float zm
     }
     r->vs = d->gvs->hash;
     r->alpha_test = ps->alpha_test ? 1u : 0u;
+    for (i = 0; i < 2; i++) {
+        KGpuTex *te = dc->te[i];
+        if (!te || !te->rt_h) continue;
+        if (te->rt_index == -1) { te->rt_index = krt_tex_add(te->rt_h); if (te->rt_index < 0) te->rt_index = -2; }
+        if (te->rt_index < 0) continue;
+        r->rt_tex[i] = (uint32_t)te->rt_index;
+        r->rt_flags |= i ? KRT_TEX1 : KRT_TEX0;
+        if (ps->tex[i].linear) r->rt_flags |= i ? KRT_TEX1_TEXELS : KRT_TEX0_TEXELS;
+    }
+    if (ps->alpha_test)
+        r->rt_flags |= KRT_ALPHA_TEST | ((uint32_t)(ps->alpha_func & 7) << 8) | ((uint32_t)(ps->alpha_ref & 255) << 16);
     memcpy(r->m, c + 4 * 10, sizeof(r->m));
     {
         const KGpuAttrSrc *a = &d->gvs->attr[0];
@@ -346,6 +362,54 @@ fail:
     return false;
 }
 
+static float kg_rtc_half(uint16_t h)
+{
+    const int e = (h >> 10) & 31, m = h & 1023;
+    const float f = e ? (float)ldexp(1.0 + m / 1024.0, e - 15) : (float)ldexp(m / 1024.0, -14);
+    return (h & 0x8000) ? -f : f;
+}
+
+static int kg_rtc_cmp(const void *a, const void *b)
+{
+    const float x = *(const float *)a, y = *(const float *)b;
+    return x < y ? -1 : x > y;
+}
+
+/* RECOMP_KGPU_RT_VIEW=3 (diagnostic): how much brighter the picture is than the hits shaded from the textures, the
+ * median over the pixels lit by a lightmap, by vertex colour and by neither (krt_view.hlsl). */
+static void kg_rtc_calibration(void)
+{
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_MAPPED_SUBRESOURCE ms;
+    ID3D11Texture2D *st = NULL;
+    static float *ratios[3];
+    unsigned n[3] = { 0, 0, 0 }, x, y, k, cap = (s_rtc.out_w / 4 + 1) * (s_rtc.out_hh / 4 + 1);
+    for (k = 0; k < 3; k++) if (!ratios[k] && !(ratios[k] = (float *)malloc(cap * sizeof(float)))) return;
+    ID3D11Texture2D_GetDesc(s_rtc.out, &td);
+    td.Usage = D3D11_USAGE_STAGING; td.BindFlags = 0; td.CPUAccessFlags = D3D11_CPU_ACCESS_READ; td.MiscFlags = 0;
+    if (FAILED(ID3D11Device_CreateTexture2D(G.dev, &td, NULL, &st))) return;
+    ID3D11DeviceContext_CopyResource(G.ctx, (ID3D11Resource *)st, (ID3D11Resource *)s_rtc.out);
+    if (SUCCEEDED(ID3D11DeviceContext_Map(G.ctx, (ID3D11Resource *)st, 0, D3D11_MAP_READ, 0, &ms))) {
+        for (y = 0; y < td.Height; y += 4) {
+            const uint16_t *row = (const uint16_t *)((const uint8_t *)ms.pData + (size_t)y * ms.RowPitch);
+            for (x = 0; x < td.Width; x += 4) {
+                const float r = kg_rtc_half(row[x * 4]), lp = kg_rtc_half(row[x * 4 + 1]), kind = kg_rtc_half(row[x * 4 + 3]);
+                const int c = (int)(kind + 0.5f) - 1;
+                if (c < 0 || c > 2 || lp < 0.02f || n[c] >= cap) continue;   /* misses, and black pixels say little */
+                ratios[c][n[c]++] = r;
+            }
+        }
+        ID3D11DeviceContext_Unmap(G.ctx, (ID3D11Resource *)st, 0);
+    }
+    ID3D11Texture2D_Release(st);
+    for (k = 0; k < 3; k++) if (n[k]) qsort(ratios[k], n[k], sizeof(float), kg_rtc_cmp);
+    fprintf(stderr, "[KRT] calibration, picture over shaded (median, quartiles): lightmap %.3f %.3f-%.3f (%u), vertex %.3f %.3f-%.3f (%u), "
+                    "neither %.3f (%u)\n",
+            n[0] ? ratios[0][n[0] / 2] : 0.0f, n[0] ? ratios[0][n[0] / 4] : 0.0f, n[0] ? ratios[0][n[0] * 3 / 4] : 0.0f, n[0],
+            n[1] ? ratios[1][n[1] / 2] : 0.0f, n[1] ? ratios[1][n[1] / 4] : 0.0f, n[1] ? ratios[1][n[1] * 3 / 4] : 0.0f, n[1],
+            n[2] ? ratios[2][n[2] / 2] : 0.0f, n[2]);
+}
+
 /* The frame's world is drawn (cs is the main target, or NULL at a flip): turn what was captured into world space,
  * hand it to the D3D12 side and run the passes there. */
 static void kg_rtc_finish(KGpuSurf *cs)
@@ -382,10 +446,12 @@ static void kg_rtc_finish(KGpuSurf *cs)
     for (i = 0; i < s_rtc.ndraws; i++) {
         s_rtc.first[i] = s_rtc.draws[i].first;
         s_rtc.count[i] = s_rtc.draws[i].count;
-        s_rtc.opaque[i] = s_rtc.draws[i].alpha_test ? 0 : 1;
+        s_rtc.tex0[i] = s_rtc.draws[i].rt_tex[0];
+        s_rtc.tex1[i] = s_rtc.draws[i].rt_tex[1];
+        s_rtc.flags[i] = s_rtc.draws[i].rt_flags;
     }
     f.nverts = s_rtc.used; f.ndraws = s_rtc.ndraws;
-    f.first = s_rtc.first; f.count = s_rtc.count; f.opaque = s_rtc.opaque;
+    f.first = s_rtc.first; f.count = s_rtc.count; f.tex0 = s_rtc.tex0; f.tex1 = s_rtc.tex1; f.flags = s_rtc.flags;
     memcpy(f.inv, cb.inv, sizeof(f.inv));
     memcpy(f.c58, cb.c58, sizeof(f.c58));
     memcpy(f.c59, cb.c59, sizeof(f.c59));
@@ -393,17 +459,21 @@ static void kg_rtc_finish(KGpuSurf *cs)
     f.zmax = 1.0f / s_rtc.scale[2];
     f.guest_w = 2.0f / s_rtc.scale[0]; f.guest_h = 2.0f / s_rtc.scale[1];
     sized = cs && kg_rtc_output(cs->hw, cs->hh);
-    f.view = s_rtc.view && sized;
+    f.view = sized ? s_rtc.view : 0;
     /* reflections: when the env draws marked pixels this frame, at the picture's size and format */
     f.reflect = s_rtc.reflect && sized && s_ssr.used && s_ssr.w == cs->hw && s_ssr.h == cs->hh &&
                 cs->dxfmt == DXGI_FORMAT_B8G8R8A8_UNORM;
+    /* the picture so far: the reflections read it, and shading learns its brightness from it */
+    f.calibrate = sized && cs->dxfmt == DXGI_FORMAT_B8G8R8A8_UNORM;
+    if (f.calibrate) ID3D11DeviceContext_CopyResource(G.ctx, (ID3D11Resource *)s_rtc.in[0], (ID3D11Resource *)cs->tex);
     if (f.reflect) {
-        ID3D11DeviceContext_CopyResource(G.ctx, (ID3D11Resource *)s_rtc.in[0], (ID3D11Resource *)cs->tex);
         ID3D11DeviceContext_CopyResource(G.ctx, (ID3D11Resource *)s_rtc.in[1], (ID3D11Resource *)s_ssr.tex[0]);
         ID3D11DeviceContext_CopyResource(G.ctx, (ID3D11Resource *)s_rtc.in[2], (ID3D11Resource *)s_ssr.tex[2]);
     }
     if (!krt_frame(&f)) return;
-    if (f.view && s_rtc.ps_view && post_init()) {
+    if (f.view >= 3) {
+        if (++s_rtc.calib % 120 == 0) kg_rtc_calibration();
+    } else if (f.view && s_rtc.ps_view && post_init()) {
         post_pass(s_rtc.ps_view, cs->rtv, cs->hw, cs->hh, s_rtc.out_srv, NULL, NULL, NULL);
         kg_cache_invalidate();
     } else if (f.reflect) {

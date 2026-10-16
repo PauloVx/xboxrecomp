@@ -53,6 +53,7 @@ typedef struct KgDc {
     float zbias, zslope;
     ID3D11ShaderResourceView *srv[4];
     ID3D11SamplerState *smp[4];
+    KGpuTex *te[4];              /* the cache entries behind srv (ray tracing shades with them) */
     bool tex_ok;                 /* the slots resolved to plain textures: nothing per draw */
     uint64_t tex_epoch, tex_surfgen;
 } KgDc;
@@ -452,6 +453,7 @@ static void kgpu_draw_now(const KGpuDraw *d)
             KGpuSurf *fs;
             dc->srv[i] = G.dummy_srv;
             dc->smp[i] = NULL;
+            dc->te[i] = NULL;
             if (ps->tex_mode[i] != PS_TEXTUREMODES_PROJECT2D || !tx->valid) continue;
             fs = surf_for_texture(tx);
             if (fs) {
@@ -479,6 +481,7 @@ static void kgpu_draw_now(const KGpuDraw *d)
                 if (ds) plain = false;
                 v = ds ? depth_as_color(ds) : tex_get(tx);
                 if (v) dc->srv[i] = v;
+                if (!ds && v && G.last_tex && G.last_tex->srv == v) dc->te[i] = G.last_tex;
             }
             dc->smp[i] = get_sampler(tx);
         }

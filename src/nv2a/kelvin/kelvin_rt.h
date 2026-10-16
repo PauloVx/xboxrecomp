@@ -31,21 +31,33 @@ bool krt_set_geometry(HANDLE texture, unsigned width, unsigned height);
  * to. */
 bool krt_set_output(HANDLE texture, unsigned width, unsigned height);
 
+/* A game texture (created by D3D11, shared by NT handle) the passes may shade hits with; its index for KrtFrame.
+ * -1 when it cannot be opened. Removing it releases it once the GPU no longer uses it. */
+int krt_tex_add(HANDLE texture);
+void krt_tex_remove(int index);
+
+/* KrtFrame.flags, a draw's */
+enum {
+    KRT_TEX0 = 1u, KRT_TEX1 = 2u,      /* textured on stage 0 (coordinates uv0) / stage 1 (uv1) */
+    KRT_TEX0_TEXELS = 4u, KRT_TEX1_TEXELS = 8u, /* those coordinates count texels (a linear texture) */
+    KRT_ALPHA_TEST = 16u               /* alpha test: function in bits 8..10, reference in bits 16..23 */
+};
+
 /* One frame's captured world: `nverts` vertices, three a triangle, in `ndraws` draws of `count[i]` vertices from
- * `first[i]`; `opaque[i]` is zero for a draw whose texture's alpha cuts it out. The camera: `inv` the inverse of its
- * matrix's x, y and w rows with their offsets (KrtCb in kelvin_gpu_rt.inc), the viewport c58/c59 and the guest
- * window size. */
+ * `first[i]`, textured with tex0[i]/tex1[i] (krt_tex_add's indices) as flags[i] says. The camera: `inv` the inverse
+ * of its matrix's x, y and w rows with their offsets (KrtCb in kelvin_gpu_rt.inc), the viewport c58/c59 and the
+ * guest window size. */
 typedef struct KrtFrame {
     uint32_t nverts;
     unsigned ndraws;
-    const uint32_t *first, *count;
-    const uint8_t *opaque;
+    const uint32_t *first, *count, *tex0, *tex1, *flags;
     float inv[12], c58[4], c59[4];
     float vp[16];                      /* the camera matrix itself, rows c[10..13] */
     float zmax;                        /* the depth buffer's largest value */
     float guest_w, guest_h;
-    bool view;                         /* RECOMP_KGPU_RT_VIEW: the camera's view, traced, into the output */
+    int view;                          /* RECOMP_KGPU_RT_VIEW: the camera's view traced into the output (1 normals, 2 shaded) */
     bool reflect;                      /* reflections for the pixels the screen-space targets marked */
+    bool calibrate;                    /* the picture input holds this frame: learn shading brightness from it */
 } KrtFrame;
 
 /* The per-frame inputs of the reflections, made by D3D11 at the output's size and shared by NT handle: the picture

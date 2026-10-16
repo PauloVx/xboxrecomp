@@ -27,29 +27,37 @@
 #include "krt_unpack.h"
 #include "krt_view.h"
 #include "krt_reflect.h"
+#include "krt_calibrate.h"
+#include "krt_calib_update.h"
 #endif
 
 #define KRT_RELEASE(p) do { if (p) { IUnknown_Release((IUnknown *)(p)); (p) = NULL; } } while (0)
 #define KRT_SLOTS 3
 #define KRT_DRAWS_MAX 4096u
+#define KRT_TEX_MAX 4096u
+#define KRT_TEX_PENDING 1024u
 
 typedef HRESULT (WINAPI *PfnCreateDevice)(IUnknown *, D3D_FEATURE_LEVEL, REFIID, void **);
 typedef HRESULT (WINAPI *PfnGetDebug)(REFIID, void **);
 typedef HRESULT (WINAPI *PfnSerializeRoot)(const D3D12_ROOT_SIGNATURE_DESC *, D3D_ROOT_SIGNATURE_VERSION, ID3DBlob **, ID3DBlob **);
 
 /* Descriptor heap: the unpack pass's inputs, a trace table a slot (its draw list differs), the unpack outputs, the
- * trace outputs. Each table is as long as the root signature's range. */
+ * trace outputs, the game's textures. Each table is as long as the root signature's range. */
 enum {
     H_UNPACK_SRV = 0,
     H_TRACE_SRV = 8,                   /* + 8 * slot */
     H_UNPACK_UAV = H_TRACE_SRV + 8 * KRT_SLOTS,
     H_TRACE_UAV = H_UNPACK_UAV + 4,
-    H_COUNT = H_TRACE_UAV + 4
+    H_TEX = H_TRACE_UAV + 4,
+    H_COUNT = H_TEX + KRT_TEX_MAX
 };
 
 /* Constants a slot: the unpack pass's at 0, the frame's at 256. */
 typedef struct KrtUnpackCb { uint32_t n, width, pad[2]; } KrtUnpackCb;
-typedef struct KrtFrameCb { float inv[12], c58[4], c59[4], size[4], vp0[4], vp1[4], vp3[4], zp[4]; } KrtFrameCb;
+typedef struct KrtFrameCb { float inv[12], c58[4], c59[4], size[4], vp0[4], vp1[4], vp3[4], zp[4], misc[4]; } KrtFrameCb;
+
+/* The brightness factors shade learns (krt_calibrate.hlsl): one a texture index, then one a kind of lighting. */
+#define KRT_FACTOR_KEYS (KRT_TEX_MAX + 3u)
 
 static struct {
     bool ok;
@@ -69,7 +77,9 @@ static struct {
     uint64_t fence_value;
 
     ID3D12RootSignature *root;
-    ID3D12PipelineState *pso_unpack, *pso_view, *pso_reflect;
+    ID3D12PipelineState *pso_unpack, *pso_view, *pso_reflect, *pso_calibrate, *pso_calib_update;
+    ID3D12Resource *sums, *factors;     /* the brightness calibration's sums and its factors */
+    uint64_t frame;
     ID3D12DescriptorHeap *heap;
     UINT inc;
 
@@ -77,8 +87,11 @@ static struct {
     unsigned geo_w, geo_h, max_verts;
     ID3D12Resource *pos, *uv, *col;     /* unpacked: 12, 16 and 4 bytes a vertex */
     bool vb_readable;                   /* in the shader-resource state (else unordered access) */
-    ID3D12Resource *draws;              /* upload: KRT_SLOTS lists of each draw's first vertex */
+    ID3D12Resource *draws;              /* upload: KRT_SLOTS lists of each draw's first vertex, textures and flags */
     uint32_t *draws_cpu;
+    ID3D12Resource *tex[KRT_TEX_MAX];   /* the game's textures, by index (krt_tex_add) */
+    struct { int index; uint64_t value; } pending[KRT_TEX_PENDING]; /* removed, released once the GPU passes value */
+    unsigned npending;
     ID3D12Resource *consts;             /* upload: 512 bytes a slot */
     uint8_t *consts_cpu;
     ID3D12Resource *instance;           /* upload: the one instance */
@@ -158,6 +171,17 @@ static void null_srv(unsigned slot)
     ID3D12Device5_CreateShaderResourceView(K.dev, NULL, &d, cpu_handle(slot));
 }
 
+static void null_tex(unsigned slot)
+{
+    D3D12_SHADER_RESOURCE_VIEW_DESC d;
+    memset(&d, 0, sizeof(d));
+    d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    d.Texture2D.MipLevels = 1;
+    ID3D12Device5_CreateShaderResourceView(K.dev, NULL, &d, cpu_handle(slot));
+}
+
 static void null_uav(unsigned slot)
 {
     D3D12_UNORDERED_ACCESS_VIEW_DESC d;
@@ -192,7 +216,7 @@ static void write_trace_tables(void)
         d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         d.Buffer.FirstElement = (UINT64)s * KRT_DRAWS_MAX;
         d.Buffer.NumElements = KRT_DRAWS_MAX;
-        d.Buffer.StructureByteStride = 4;
+        d.Buffer.StructureByteStride = 16;
         ID3D12Device5_CreateShaderResourceView(K.dev, K.draws, &d, cpu_handle(t + 4));
         for (i = 5; i < 8; i++) {
             static const DXGI_FORMAT fmt[3] = { DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R32G32B32A32_FLOAT };
@@ -221,9 +245,12 @@ void krt_shutdown(void)
 {
     unsigned i;
     release_scene();
+    for (i = 0; i < KRT_TEX_MAX; i++) KRT_RELEASE(K.tex[i]);
+    K.npending = 0;
     KRT_RELEASE(K.geo); KRT_RELEASE(K.out); KRT_RELEASE(K.in_pic); KRT_RELEASE(K.in_w); KRT_RELEASE(K.in_g);
     KRT_RELEASE(K.draws); KRT_RELEASE(K.consts); KRT_RELEASE(K.instance);
-    KRT_RELEASE(K.pso_unpack); KRT_RELEASE(K.pso_view); KRT_RELEASE(K.pso_reflect); KRT_RELEASE(K.root); KRT_RELEASE(K.heap);
+    KRT_RELEASE(K.pso_unpack); KRT_RELEASE(K.pso_view); KRT_RELEASE(K.pso_reflect);
+    KRT_RELEASE(K.pso_calibrate); KRT_RELEASE(K.pso_calib_update); KRT_RELEASE(K.sums); KRT_RELEASE(K.factors); KRT_RELEASE(K.root); KRT_RELEASE(K.heap);
     KRT_RELEASE(K.list);
     for (i = 0; i < KRT_SLOTS; i++) KRT_RELEASE(K.alloc[i]);
     KRT_RELEASE(K.queue); KRT_RELEASE(K.fence); KRT_RELEASE(K.dev);
@@ -361,13 +388,15 @@ static ID3D12PipelineState *make_pso(const void *code, size_t n)
     return p;
 }
 
-/* Root signature: b0 the constants, then a table of eight shader resources and one of four unordered-access views. */
+/* Root signature: b0 the constants, a table of eight shader resources, one of four unordered-access views, and the
+ * game's textures (space 1) with a wrapping linear sampler. */
 static bool make_pipelines(void)
 {
 #ifdef KRT_HAVE_SHADERS
     PfnSerializeRoot serialize = (PfnSerializeRoot)(void *)GetProcAddress(K.lib, "D3D12SerializeRootSignature");
-    D3D12_DESCRIPTOR_RANGE ranges[2];
-    D3D12_ROOT_PARAMETER params[3];
+    D3D12_DESCRIPTOR_RANGE ranges[3];
+    D3D12_ROOT_PARAMETER params[4];
+    D3D12_STATIC_SAMPLER_DESC smp;
     D3D12_ROOT_SIGNATURE_DESC rs;
     D3D12_DESCRIPTOR_HEAP_DESC hd;
     ID3DBlob *blob = NULL, *errors = NULL;
@@ -376,15 +405,22 @@ static bool make_pipelines(void)
     memset(ranges, 0, sizeof(ranges)); memset(params, 0, sizeof(params)); memset(&rs, 0, sizeof(rs));
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; ranges[0].NumDescriptors = 8;
     ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; ranges[1].NumDescriptors = 4;
+    ranges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; ranges[2].NumDescriptors = KRT_TEX_MAX; ranges[2].RegisterSpace = 1;
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    for (i = 0; i < 2; i++) {
+    for (i = 0; i < 3; i++) {
         params[1 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[1 + i].DescriptorTable.NumDescriptorRanges = 1;
         params[1 + i].DescriptorTable.pDescriptorRanges = &ranges[i];
         params[1 + i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     }
-    rs.NumParameters = 3; rs.pParameters = params;
+    memset(&smp, 0, sizeof(smp));
+    smp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    smp.AddressU = smp.AddressV = smp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    smp.MaxLOD = D3D12_FLOAT32_MAX;
+    smp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    rs.NumParameters = 4; rs.pParameters = params;
+    rs.NumStaticSamplers = 1; rs.pStaticSamplers = &smp;
     if (FAILED(serialize(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors)) ||
         FAILED(ID3D12Device5_CreateRootSignature(K.dev, 0, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob),
                                                  &IID_ID3D12RootSignature, (void **)&K.root))) {
@@ -396,7 +432,9 @@ static bool make_pipelines(void)
     K.pso_unpack = make_pso(krt_unpack_cs, sizeof(krt_unpack_cs));
     K.pso_view = make_pso(krt_view_cs, sizeof(krt_view_cs));
     K.pso_reflect = make_pso(krt_reflect_cs, sizeof(krt_reflect_cs));
-    if (!K.pso_unpack || !K.pso_view || !K.pso_reflect) { fprintf(stderr, "[KRT] compute pipelines failed\n"); return false; }
+    K.pso_calibrate = make_pso(krt_calibrate_cs, sizeof(krt_calibrate_cs));
+    K.pso_calib_update = make_pso(krt_calib_update_cs, sizeof(krt_calib_update_cs));
+    if (!K.pso_unpack || !K.pso_view || !K.pso_reflect || !K.pso_calibrate || !K.pso_calib_update) { fprintf(stderr, "[KRT] compute pipelines failed\n"); return false; }
 
     memset(&hd, 0, sizeof(hd));
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = H_COUNT;
@@ -405,10 +443,11 @@ static bool make_pipelines(void)
     K.inc = ID3D12Device5_GetDescriptorHandleIncrementSize(K.dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     for (i = 0; i < H_COUNT; i++) {
         if ((i >= H_UNPACK_UAV && i < H_UNPACK_UAV + 4) || (i >= H_TRACE_UAV && i < H_TRACE_UAV + 4)) null_uav(i);
+        else if (i >= H_TEX) null_tex(i);
         else null_srv(i);
     }
 
-    K.draws = make_buffer((UINT64)KRT_SLOTS * KRT_DRAWS_MAX * 4, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    K.draws = make_buffer((UINT64)KRT_SLOTS * KRT_DRAWS_MAX * 16, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
     K.consts = make_buffer((UINT64)KRT_SLOTS * 512, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
     K.instance = make_buffer(sizeof(D3D12_RAYTRACING_INSTANCE_DESC), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
     if (!K.draws || !K.consts || !K.instance ||
@@ -416,6 +455,11 @@ static bool make_pipelines(void)
         FAILED(ID3D12Resource_Map(K.consts, 0, NULL, (void **)&K.consts_cpu)) ||
         FAILED(ID3D12Resource_Map(K.instance, 0, NULL, (void **)&K.instance_cpu)))
         return false;
+    K.sums = make_buffer((UINT64)KRT_FACTOR_KEYS * 8, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    K.factors = make_buffer((UINT64)KRT_FACTOR_KEYS * 4, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (!K.sums || !K.factors) return false;
+    raw_uav(H_TRACE_UAV + 1, K.sums, (UINT64)KRT_FACTOR_KEYS * 8);
+    raw_uav(H_TRACE_UAV + 2, K.factors, (UINT64)KRT_FACTOR_KEYS * 4);
     K.geoms = (D3D12_RAYTRACING_GEOMETRY_DESC *)calloc(KRT_DRAWS_MAX, sizeof(*K.geoms));
     return K.geoms != NULL;
 #else
@@ -540,6 +584,49 @@ bool krt_set_output(HANDLE texture, unsigned width, unsigned height)
     return true;
 }
 
+/* Removed textures whose last frame the GPU has finished: released, and their index free again. */
+static void release_textures(void)
+{
+    const uint64_t done = ID3D12Fence_GetCompletedValue(K.fence);
+    unsigned i = 0;
+    while (i < K.npending) {
+        if (K.pending[i].value > done) { i++; continue; }
+        KRT_RELEASE(K.tex[K.pending[i].index]);
+        null_tex(H_TEX + (unsigned)K.pending[i].index);
+        K.pending[i] = K.pending[--K.npending];
+    }
+}
+
+int krt_tex_add(HANDLE texture)
+{
+    unsigned i;
+    bool busy;
+    if (!K.ok || !texture) return -1;
+    release_textures();
+    for (i = 0; i < KRT_TEX_MAX; i++) {
+        unsigned k;
+        if (K.tex[i]) continue;
+        for (busy = false, k = 0; k < K.npending; k++) if (K.pending[k].index == (int)i) { busy = true; break; }
+        if (!busy) break;
+    }
+    if (i == KRT_TEX_MAX) return -1;
+    if (FAILED(ID3D12Device5_OpenSharedHandle(K.dev, texture, &IID_ID3D12Resource, (void **)&K.tex[i]))) {
+        K.tex[i] = NULL;
+        return -1;
+    }
+    ID3D12Device5_CreateShaderResourceView(K.dev, K.tex[i], NULL, cpu_handle(H_TEX + i));
+    return (int)i;
+}
+
+void krt_tex_remove(int index)
+{
+    if (!K.ok || index < 0 || index >= (int)KRT_TEX_MAX || !K.tex[index]) return;
+    if (K.npending == KRT_TEX_PENDING) { wait_fence(K.fence_value); release_textures(); }
+    K.pending[K.npending].index = index;
+    K.pending[K.npending].value = K.fence_value;
+    K.npending++;
+}
+
 bool krt_set_inputs(HANDLE picture, HANDLE weight, HANDLE surface)
 {
     if (!K.ok) return false;
@@ -586,6 +673,7 @@ bool krt_frame(const KrtFrame *f)
     bool moved = false, wrote = false;
 
     if (!K.ok || !K.geo || !f->nverts || !f->ndraws || f->nverts > K.max_verts) return false;
+    release_textures();
     n = f->ndraws < KRT_DRAWS_MAX ? f->ndraws : KRT_DRAWS_MAX;
 
     /* The scene this frame: one geometry a draw, its triangles where the unpack pass puts them. */
@@ -593,7 +681,7 @@ bool krt_frame(const KrtFrame *f)
         D3D12_RAYTRACING_GEOMETRY_DESC *g = &K.geoms[i];
         memset(g, 0, sizeof(*g));
         g->Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
-        g->Flags = f->opaque[i] ? D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE : D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
+        g->Flags = (f->flags[i] & KRT_ALPHA_TEST) ? D3D12_RAYTRACING_GEOMETRY_FLAG_NONE : D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
         g->Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
         g->Triangles.VertexCount = f->count[i];
         g->Triangles.VertexBuffer.StartAddress = ID3D12Resource_GetGPUVirtualAddress(K.pos) + (UINT64)f->first[i] * 12;
@@ -647,9 +735,13 @@ bool krt_frame(const KrtFrame *f)
         fc->zp[0] = wr[best] != 0.0f ? zr[best] / wr[best] : 1.0f;
         fc->zp[1] = zr[3] - fc->zp[0] * wr[3];
         fc->zp[2] = f->zmax;
-        fc->zp[3] = 0.0f;
+        fc->zp[3] = (float)f->view;
     }
-    memcpy(K.draws_cpu + K.slot * KRT_DRAWS_MAX, f->first, n * sizeof(uint32_t));
+    fc->misc[0] = (float)(K.frame++ % 4096u);
+    for (i = 0; i < n; i++) {
+        uint32_t *d = K.draws_cpu + ((size_t)K.slot * KRT_DRAWS_MAX + i) * 4;
+        d[0] = f->first[i]; d[1] = f->tex0[i]; d[2] = f->tex1[i]; d[3] = f->flags[i];
+    }
     memset(K.instance_cpu, 0, sizeof(*K.instance_cpu));
     K.instance_cpu->Transform[0][0] = K.instance_cpu->Transform[1][1] = K.instance_cpu->Transform[2][2] = 1.0f;
     K.instance_cpu->InstanceMask = 0xFF;
@@ -659,6 +751,7 @@ bool krt_frame(const KrtFrame *f)
     heaps[0] = K.heap;
     ID3D12GraphicsCommandList4_SetDescriptorHeaps(K.list, 1, heaps);
     ID3D12GraphicsCommandList4_SetComputeRootSignature(K.list, K.root);
+    ID3D12GraphicsCommandList4_SetComputeRootDescriptorTable(K.list, 3, gpu_handle(H_TEX));
 
     /* Unpack. */
     barrier(K.geo, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -693,6 +786,21 @@ bool krt_frame(const KrtFrame *f)
     ID3D12GraphicsCommandList4_BuildRaytracingAccelerationStructure(K.list, &build, 0, NULL);
     uav_barrier(K.tlas);
 
+    if (f->calibrate && K.out && K.in_pic) {
+        /* the brightness factors, from what the camera sees of the picture this frame */
+        ID3D12GraphicsCommandList4_SetComputeRootConstantBufferView(K.list, 0, cva + 256);
+        ID3D12GraphicsCommandList4_SetComputeRootDescriptorTable(K.list, 1, gpu_handle(H_TRACE_SRV + 8 * K.slot));
+        ID3D12GraphicsCommandList4_SetComputeRootDescriptorTable(K.list, 2, gpu_handle(H_TRACE_UAV));
+        barrier(K.in_pic, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        ID3D12GraphicsCommandList4_SetPipelineState(K.list, K.pso_calibrate);
+        ID3D12GraphicsCommandList4_Dispatch(K.list, (K.out_w / 8 + 7) / 8, (K.out_h / 8 + 7) / 8, 1);
+        uav_barrier(K.sums);
+        ID3D12GraphicsCommandList4_SetPipelineState(K.list, K.pso_calib_update);
+        ID3D12GraphicsCommandList4_Dispatch(K.list, (KRT_FACTOR_KEYS + 63) / 64, 1, 1);
+        uav_barrier(K.factors);
+        uav_barrier(K.sums);
+        barrier(K.in_pic, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    }
     if (f->reflect && !f->view && K.out && K.in_pic && K.in_w && K.in_g) {
         ID3D12GraphicsCommandList4_SetPipelineState(K.list, K.pso_reflect);
         ID3D12GraphicsCommandList4_SetComputeRootConstantBufferView(K.list, 0, cva + 256);
@@ -714,9 +822,11 @@ bool krt_frame(const KrtFrame *f)
         ID3D12GraphicsCommandList4_SetComputeRootConstantBufferView(K.list, 0, cva + 256);
         ID3D12GraphicsCommandList4_SetComputeRootDescriptorTable(K.list, 1, gpu_handle(H_TRACE_SRV + 8 * K.slot));
         ID3D12GraphicsCommandList4_SetComputeRootDescriptorTable(K.list, 2, gpu_handle(H_TRACE_UAV));
+        if (K.in_pic) barrier(K.in_pic, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         barrier(K.out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         ID3D12GraphicsCommandList4_Dispatch(K.list, (K.out_w + 7) / 8, (K.out_h + 7) / 8, 1);
         barrier(K.out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+        if (K.in_pic) barrier(K.in_pic, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
         wrote = true;
     }
 

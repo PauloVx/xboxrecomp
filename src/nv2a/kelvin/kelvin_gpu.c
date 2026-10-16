@@ -154,6 +154,8 @@ typedef struct KGpuTex {
     size_t bytes;
     ID3D11Texture2D *tex;
     ID3D11ShaderResourceView *srv;
+    HANDLE rt_h;                       /* ray tracing: the texture shared with the D3D12 side, */
+    int rt_index;                      /* and its index there once a captured draw used it (-1 before) */
 } KGpuTex;
 
 typedef struct KeyedPtr { uint64_t key; void *ptr; } KeyedPtr;
@@ -163,6 +165,7 @@ static struct {
     ID3D11Device *dev;
     ID3D11DeviceContext *ctx;
     ID3D11DeviceContext1 *ctx1;
+    KGpuTex *last_tex;                 /* the cache entry tex_get last looked at */
     HMODULE compiler;
     HRESULT (WINAPI *compile)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO *,
                               ID3DInclude *, LPCSTR, LPCSTR, UINT, UINT,
@@ -1230,6 +1233,8 @@ static void decode_dxt_level(const KTexture *t, unsigned int level, uint32_t *ou
 static void tex_free(KGpuTex *e)
 {
     kg_cache_invalidate();
+    if (e->rt_index >= 0 && e->used) krt_tex_remove(e->rt_index);
+    if (e->rt_h) CloseHandle(e->rt_h);
     SAFE_RELEASE(e->srv);
     SAFE_RELEASE(e->tex);
     G.tex_bytes -= e->bytes;
@@ -1274,6 +1279,7 @@ static ID3D11ShaderResourceView *tex_get(const KTexture *t)
         }
     }
     if (!e) return NULL;
+    G.last_tex = e;
     if (e->used) {
         if (e->epoch == G.epoch) { e->clock = G.clock; G.tex_hits++; return e->srv; }
         G.tex_validations++;
@@ -1293,6 +1299,11 @@ static ID3D11ShaderResourceView *tex_get(const KTexture *t)
     memset(&td, 0, sizeof(td));
     td.Width = t->width; td.Height = t->height; td.MipLevels = levels; td.ArraySize = 1;
     td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_IMMUTABLE; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    if (krt_available()) {
+        /* rays shade what they hit with the game's textures: shared with the D3D12 side */
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+    }
     memset(buffers, 0, sizeof(buffers));
     if (dxt && (t->width % 4) == 0 && (t->height % 4) == 0) {
         native_dxt = true;
@@ -1355,6 +1366,14 @@ static ID3D11ShaderResourceView *tex_get(const KTexture *t)
         e->span = span; e->sig[0] = sig[0]; e->sig[1] = sig[1];
         e->epoch = G.epoch; e->clock = G.clock;
         e->tex = tex; e->srv = srv;
+        e->rt_h = NULL; e->rt_index = -1;
+        if (td.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE) {
+            IDXGIResource1 *r1 = NULL;
+            if (SUCCEEDED(ID3D11Texture2D_QueryInterface(tex, &IID_IDXGIResource1, (void **)&r1))) {
+                if (FAILED(IDXGIResource1_CreateSharedHandle(r1, NULL, DXGI_SHARED_RESOURCE_READ, NULL, &e->rt_h))) e->rt_h = NULL;
+                IDXGIResource1_Release(r1);
+            }
+        }
         {
             size_t bytes = 0;
             for (level = 0; level < levels; level++) {
