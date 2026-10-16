@@ -1435,6 +1435,16 @@ static const char *localized_video_literal(const char *text)
         { "MOTION BLUR", "DESFOQUE DE MOVIMENTO", "DESENFOQUE DE MOVIMIENTO", "FLOU DE MOUVEMENT", "BEWEGUNGSUNSCHÄRFE", "MOSSO DI MOVIMENTO" },
         { "CROSSHAIR", "MIRA", "PUNTO DE MIRA", "RÉTICULE", "FADENKREUZ", "MIRINO" },
         { "HIT MARKERS", "MARCADORES DE ACERTO", "MARCADORES DE IMPACTO", "MARQUEURS D’IMPACT", "TREFFERMARKER", "INDICATORI DI COLPO" },
+        /* the players before the difficulty (split-screen) */
+        { "PLAYERS", "JOGADORES", "JUGADORES", "JOUEURS", "SPIELER", "GIOCATORI" },
+        { "ONE PLAYER", "UM JOGADOR", "UN JUGADOR", "UN JOUEUR", "EIN SPIELER", "UN GIOCATORE" },
+        { "TWO PLAYERS", "DOIS JOGADORES", "DOS JUGADORES", "DEUX JOUEURS", "ZWEI SPIELER", "DUE GIOCATORI" },
+        { "TWO PLAYERS: PLAYER TWO IN THE BOTTOM HALF, ON THE SECOND CONTROLLER OR THE ARROWS AND THE NUMPAD.",
+          "DOIS JOGADORES: O JOGADOR DOIS NA METADE DE BAIXO, NO SEGUNDO CONTROLE OU NAS SETAS E NO TECLADO NUMÉRICO.",
+          "DOS JUGADORES: EL JUGADOR DOS EN LA MITAD DE ABAJO, CON EL SEGUNDO MANDO O LAS FLECHAS Y EL TECLADO NUMÉRICO.",
+          "DEUX JOUEURS : LE JOUEUR DEUX EN BAS, À LA DEUXIÈME MANETTE OU AUX FLÈCHES ET AU PAVÉ NUMÉRIQUE.",
+          "ZWEI SPIELER: SPIELER ZWEI UNTEN, MIT DEM ZWEITEN CONTROLLER ODER DEN PFEILTASTEN UND DEM ZIFFERNBLOCK.",
+          "DUE GIOCATORI: IL GIOCATORE DUE IN BASSO, CON IL SECONDO CONTROLLER O LE FRECCE E IL TASTIERINO NUMERICO." },
         /* photo mode (Portuguese reviewed; the others machine drafts, like the launcher's) */
         { "PHOTO MODE", "MODO FOTO", "MODO FOTO", "MODE PHOTO", "FOTOMODUS", "MODALITÀ FOTO" },
         { "WEAPON", "ARMA", "ARMA", "ARME", "WAFFE", "ARMA" },
@@ -1471,7 +1481,7 @@ static const char *localized_video_literal(const char *text)
     int i;
     if (!_strnicmp(active_page, "Controls", 8) || !strcmp(text, "CONTROLS")) return controls_text(text);
     if (!locale || (_stricmp(active_page, "VideoSettings") && _stricmp(active_page, "VideoDisplay") && _stricmp(active_page, "VideoGraphics") &&
-                    _stricmp(active_page, "PhotoMode"))) return text;
+                    _stricmp(active_page, "PhotoMode") && _stricmp(active_page, "Players"))) return text;
     for (i = 0; i < (int)(sizeof(words) / sizeof(words[0])); ++i)
         if (!strcmp(text, words[i].english)) {
             const char *values[] = { words[i].english, words[i].pt, words[i].es, words[i].fr, words[i].de, words[i].it };

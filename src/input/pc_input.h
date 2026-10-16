@@ -124,7 +124,8 @@ typedef struct PcInputFilter {
     int (*motion)(long dx, long dy);
 } PcInputFilter;
 void pc_input_set_filter(const PcInputFilter *filter);
-/* Priority: slot 2 (native movies), slot 3 (photo mode), slot 0 (Video Settings), slot 1 (native menus). */
+/* Priority: slot 2 (native movies), slot 3 (photo mode), slot 0 (Video Settings), slot 1 (native menus), slot 4
+ * (split-screen's second player). */
 void pc_input_set_filter_slot(int slot, const PcInputFilter *filter);
 /* A module that wants the pointer captured (hidden, confined, raw motion) outside gameplay: photo mode. */
 void pc_input_set_capture_query(int (*query)(void));

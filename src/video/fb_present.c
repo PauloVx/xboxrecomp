@@ -840,23 +840,9 @@ static void fb_crosshair_draw(FbGpu *g, const FbPresentRect *r)
     float constants[12];
     D3D11_VIEWPORT viewport;
     const FLOAT factor[4] = {0, 0, 0, 0};
+    const int split = pc_split_frame();
+    int player;
     if (!g->xh_ps || !g->xh_cb || !g->ovl_blend || pc_menu_active() || pc_photo_active() || !pc_crosshair_frame(&x)) return;
-    constants[0] = (float)r->x + (float)r->width * 0.5f; constants[1] = (float)r->y + (float)r->height * 0.5f;
-    constants[2] = (float)r->height / 1080.0f; constants[3] = (float)x.style;
-    if (pc_split_frame()) {
-        /* over player one's view, at the size of its HUD */
-        int v[4];
-        float sw, sh;
-        pc_split_rect(PCS_VIEW_HUD, v);
-        constants[0] = (float)r->x + (float)r->width * (float)(v[0] + v[2]) / 1280.0f;
-        constants[1] = (float)r->y + (float)r->height * (float)(v[1] + v[3]) / 960.0f;
-        sw = (float)(v[2] - v[0]) / 640.0f; sh = (float)(v[3] - v[1]) / 480.0f;
-        constants[2] *= sw < sh ? sw : sh;
-    }
-    constants[4] = x.gap; constants[5] = x.length; constants[6] = x.thickness; constants[7] = x.alpha;
-    constants[8] = x.marker_alpha; constants[9] = x.marker_inner; constants[10] = x.marker_outer;
-    constants[11] = x.marker_kill ? 1.0f : 0.0f;
-    ID3D11DeviceContext_UpdateSubresource(g->context, (ID3D11Resource *)g->xh_cb, 0, NULL, constants, 0, 0);
     viewport.TopLeftX = 0; viewport.TopLeftY = 0; viewport.Width = (FLOAT)g->width; viewport.Height = (FLOAT)g->height;
     viewport.MinDepth = 0; viewport.MaxDepth = 1;
     ID3D11DeviceContext_RSSetViewports(g->context, 1, &viewport);
@@ -864,7 +850,21 @@ static void fb_crosshair_draw(FbGpu *g, const FbPresentRect *r)
     ID3D11DeviceContext_OMSetBlendState(g->context, g->ovl_blend, factor, 0xFFFFFFFFu);
     ID3D11DeviceContext_PSSetShader(g->context, g->xh_ps, NULL, 0);
     ID3D11DeviceContext_PSSetConstantBuffers(g->context, 0, 1, &g->xh_cb);
-    ID3D11DeviceContext_Draw(g->context, 3, 0);
+    /* split-screen: one over each player's view, at the size of its HUD; the hit markers are player one's */
+    for (player = 0; player < (split ? 2 : 1); player++) {
+        int v[4];
+        float sw, sh;
+        pc_split_rect_for(split, player, v);
+        constants[0] = (float)r->x + (float)r->width * (float)(v[0] + v[2]) / 1280.0f;
+        constants[1] = (float)r->y + (float)r->height * (float)(v[1] + v[3]) / 960.0f;
+        sw = (float)(v[2] - v[0]) / 640.0f; sh = (float)(v[3] - v[1]) / 480.0f;
+        constants[2] = (float)r->height / 1080.0f * (sw < sh ? sw : sh); constants[3] = (float)x.style;
+        constants[4] = x.gap; constants[5] = x.length; constants[6] = x.thickness; constants[7] = x.alpha;
+        constants[8] = player ? 0.0f : x.marker_alpha; constants[9] = x.marker_inner; constants[10] = x.marker_outer;
+        constants[11] = x.marker_kill ? 1.0f : 0.0f;
+        ID3D11DeviceContext_UpdateSubresource(g->context, (ID3D11Resource *)g->xh_cb, 0, NULL, constants, 0, 0);
+        ID3D11DeviceContext_Draw(g->context, 3, 0);
+    }
     ID3D11DeviceContext_OMSetBlendState(g->context, NULL, factor, 0xFFFFFFFFu);
 }
 /* The debug overlay's rows into its panel texture, at the picture's top-left corner (pc_debug.h). */
@@ -1039,6 +1039,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     pc_menu_install();
     pc_movie_skip_install();
     pc_photo_install();
+    pc_split_install();
     pc_input_set_movie_active_query(fb_movie_input_active);
     {
         RAWINPUTDEVICE mouse;

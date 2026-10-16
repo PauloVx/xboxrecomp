@@ -180,9 +180,9 @@ static volatile LONG s_dx, s_dy;
 static volatile LONG s_focused = 1, s_captured;
 /* Movies own input ahead of the Video Settings page and native menus. */
 /* Slots: 0 Video Settings, 1 native menus, 2 native movies, 3 photo mode (ahead of the menus it is drawn with). */
-#define PC_FILTER_SLOTS 4
+#define PC_FILTER_SLOTS 5
 static const PcInputFilter *volatile s_filters[PC_FILTER_SLOTS];
-static const unsigned s_filter_order[PC_FILTER_SLOTS] = { 2, 3, 0, 1 };
+static const unsigned s_filter_order[PC_FILTER_SLOTS] = { 2, 3, 0, 1, 4 };
 static int (*s_capture_query)(void);
 
 static int filter_key(unsigned id, int down, int repeat)

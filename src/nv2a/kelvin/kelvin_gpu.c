@@ -133,6 +133,7 @@ typedef struct KGpuSurf {
     int view;                     /* the split-screen view it belongs to (main-size surfaces only), 0 the whole screen */
     uint32_t va, pitch, format;
     unsigned int gw, gh, hw, hh, bpp;
+    unsigned int made_w, made_h;  /* the host size it was made at (hw, hh change while DLSS has it swapped) */
     DXGI_FORMAT dxfmt;
     ID3D11Texture2D *tex;
     ID3D11RenderTargetView *rtv;
@@ -913,7 +914,8 @@ static KGpuSurf *surf_get(const KelvinTarget *t, bool depth, unsigned int format
         KGpuSurf *q = &G.surf[i];
         if (!q->used) { if (!s) s = q; continue; }
         if (q->va == va && q->depth == depth && q->view == view) {
-            if (q->pitch == pitch && q->gw == gw && q->gh == gh && q->format == format && q->swz == t->swizzled) {
+            if (q->pitch == pitch && q->gw == gw && q->gh == gh && q->format == format && q->swz == t->swizzled &&
+                q->made_w == hw && q->made_h == hh) {
                 q->clock = ++G.clock;
                 return q;
             }
@@ -954,6 +956,7 @@ static KGpuSurf *surf_get(const KelvinTarget *t, bool depth, unsigned int format
     }
     s->used = true; s->depth = depth; s->view = view; s->swz = t->swizzled; s->va = va; s->pitch = pitch; s->format = format;
     s->gw = gw; s->gh = gh; s->hw = hw; s->hh = hh; s->bpp = bpp; s->dxfmt = fmt;
+    s->made_w = hw; s->made_h = hh;
     s->clock = ++G.clock;
     s_surf_gen++;
     fprintf(stderr, "[KGPU] %s surface 0x%08X: guest %ux%u pitch %u -> host %ux%u\n",

@@ -69,6 +69,7 @@ typedef struct PcVideoSettings {
     unsigned ray_tracing;                     /* 1 = ray-traced effects (experimental), see pc_video_rt_support */
     unsigned crosshair;                       /* PCX_* (pc_crosshair.h): ORIGINAL is the game's own dot alone */
     unsigned hitmarkers;                      /* 1 = a marker when the player kills (pc_crosshair.h) */
+    unsigned split_screen;                    /* 1 = split-screen, player two in the bottom half (pc_split.h) */
     unsigned render_override_w, render_override_h; /* both non-zero: an explicit raster size (RECOMP_RENDER_*) */
 } PcVideoSettings;
 
@@ -79,7 +80,8 @@ enum {
     PCV_LOCK_FPS = 1u << 6, PCV_LOCK_ASPECT = 1u << 7, PCV_LOCK_FOV = 1u << 8, PCV_LOCK_BLUR = 1u << 9,
     PCV_LOCK_AA = 1u << 10, PCV_LOCK_AF = 1u << 11, PCV_LOCK_DOF = 1u << 12, PCV_LOCK_SHARPEN = 1u << 13,
     PCV_LOCK_AO_METHOD = 1u << 14, PCV_LOCK_AO_QUALITY = 1u << 15, PCV_LOCK_REFLECTIONS = 1u << 16,
-    PCV_LOCK_RAY_TRACING = 1u << 17, PCV_LOCK_CROSSHAIR = 1u << 18, PCV_LOCK_HITMARKERS = 1u << 19
+    PCV_LOCK_RAY_TRACING = 1u << 17, PCV_LOCK_CROSSHAIR = 1u << 18, PCV_LOCK_HITMARKERS = 1u << 19,
+    PCV_LOCK_SPLIT = 1u << 20
 };
 
 extern const unsigned pc_video_internal_heights[];   /* 480 .. 2160 */
@@ -119,6 +121,7 @@ const char *pc_video_aspect_name(unsigned aspect);       /* "original", "4:3", "
 unsigned pc_video_aspect(void);
 double pc_video_fov(void);
 int pc_video_motion_blur_off(void);
+unsigned pc_video_split(void);
 
 /* A renderer that can change its raster size while running registers here; the new sizes (the raster it draws at and
  * the internal resolution it presents) are delivered on the thread that calls pc_video_set. Without one, the internal resolution applies
