@@ -65,6 +65,7 @@ typedef struct KrtFrame {
     float light[4];                    /* towards the main light (xyz, world space) and the shadows' strength (w) */
     float ao, ao_radius, gi;           /* occlusion strength and reach, bounce-colour strength (0 off) */
     bool lighting;                     /* the depth input holds this frame: shadows, occlusion and bounce colour */
+    int history;                       /* whose history the passes carry on: 0 the whole screen, 1 and 2 split-screen views */
 } KrtFrame;
 
 /* The passes' per-frame textures, made by D3D11 at the output's size and shared by NT handle: the picture so far

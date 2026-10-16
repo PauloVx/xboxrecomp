@@ -28,6 +28,9 @@ bool kdlss_evaluate(ID3D11DeviceContext *ctx, ID3D11Resource *color, ID3D11Resou
                     ID3D11Resource *output, unsigned in_w, unsigned in_h, unsigned out_w, unsigned out_h, int quality,
                     float jitter_x, float jitter_y, bool reset);
 void kdlss_shutdown(void);
+/* Which history the evaluations that follow use: split-screen views each keep their own (0 for the whole screen). */
+#define KDLSS_SLOTS 3
+void kdlss_select(int slot);
 #endif
 
 #endif

@@ -131,11 +131,11 @@ static volatile LONG s_view_marks_count;
 
 static void view_thunk(uintptr_t rect, uintptr_t mode)
 {
-    kgpu_set_view((int)mode, (int)(rect & 0xFFFF), (int)((rect >> 16) & 0xFFFF),
+    kgpu_set_view((int)(mode & 0xFF), (int)(mode >> 8), (int)(rect & 0xFFFF), (int)((rect >> 16) & 0xFFFF),
                   (int)((rect >> 32) & 0xFFFF), (int)((rect >> 48) & 0xFFFF));
 }
 
-int kelvin_mark_view(uint32_t va, int mode, int x0, int y0, int x1, int y1)
+int kelvin_mark_view(uint32_t va, int mode, int slot, int x0, int y0, int x1, int y1)
 {
     int marked = 0;
     if (!kgpu_active() || (va & 3u) || va < KELVIN_PHYS_WINDOW ||
@@ -147,7 +147,7 @@ int kelvin_mark_view(uint32_t va, int mode, int x0, int y0, int x1, int y1)
         ViewMark *m = &s_view_marks[s_view_marks_count];
         m->va = va;
         m->rect = (uint64_t)x0 | (uint64_t)y0 << 16 | (uint64_t)x1 << 32 | (uint64_t)y1 << 48;
-        m->mode = mode;
+        m->mode = (mode & 0xFF) | (slot & 0xFF) << 8;
         InterlockedExchange(&s_view_marks_count, s_view_marks_count + 1);
         marked = 1;
     }

@@ -227,7 +227,6 @@ static bool kg_rtc_wanted(void)
 
 static bool kg_rtc_on(void)
 {
-    if (kg_split()) return false;
     if (s_rtc.state == 0) s_rtc.state = kg_rtc_setup() ? 1 : -1;
     return s_rtc.state > 0;
 }
@@ -641,6 +640,7 @@ static void kg_rtc_finish(KGpuSurf *cs, KGpuSurf *zs)
     if (s_rtc.check && ++s_rtc.frames % 300 == 0) kg_rtc_check(vp);
 
     memset(&f, 0, sizeof(f));
+    f.history = cs ? cs->view : 0;
     s_rtc.frame++;
     have_ivp = kg_rtc_inv4(vp, ivp);
     for (i = 0; i < s_rtc.ndraws; i++) {
@@ -705,6 +705,17 @@ static void kg_rtc_note_draw(const KPixelState *ps, const KGpuSurf *cs, KGpuSurf
     if (s_rtc.state > 0 && !s_rtc.done && s_rtc.ndraws >= 4 && post_main_target(cs) &&
         ps->depth_test && ps->depth_func == 7 && !ps->depth_write)
         kg_rtc_finish((KGpuSurf *)cs, zs);
+}
+
+/* The end of a world (a frame, or a split-screen view): its effects now if the HUD did not start them, on `cs`. */
+static void kg_rtc_end_frame(KGpuSurf *cs, KGpuSurf *zs)
+{
+    if (!(s_rtc.state > 0 && !s_rtc.done && s_rtc.ndraws >= 4) || !post_main_target(cs)) cs = zs = NULL;
+    kg_rtc_finish(cs, zs);
+    s_rtc.used = 0;
+    s_rtc.ndraws = 0;
+    s_rtc.overflow = false;
+    s_rtc.done = false;
 }
 
 /* At the flip: a frame with no HUD (photo mode, some cut scenes) has its effects now, on the target it shows. */

@@ -480,6 +480,10 @@ again:
         if (dc->reject == 1) G.skipped++;
         return;
     }
+    if (post_main_target(dc->cs)) {
+        if (!s_view.slot) s_view.main = dc->cs;
+        else { s_view.cs = dc->cs; if (dc->zs && ps->depth_write) s_view.zs = dc->zs; }
+    }
     kg_rtc_note_draw(ps, dc->cs, dc->zs);
     kg_post_note_draw(ps, dc->cs, dc->zs);       /* the picture effects run when the HUD begins (kelvin_gpu_post.inc) */
     if (kg_dlss_take_refresh()) { dc->valid = false; goto again; }   /* the target changed size under this draw */

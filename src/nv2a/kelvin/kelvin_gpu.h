@@ -103,13 +103,13 @@ void kgpu_clear(const KelvinTarget *t, bool color, bool depth, bool stencil,
  * the one the first-person model was made for). Pass count 0 to clear. */
 void kgpu_set_viewmodel(const uint32_t *vs_hashes, int count, float scale);
 
-/* Split-screen (GPU thread, in draw order: kelvin_mark_view). The draws and clears that follow on the 640x480 main
- * target go into the rectangle x0, y0, x1, y1 of it: CROP draws the full picture about the rectangle's centre at its
- * own size (a view as wide as the picture, cut to its height), FIT scales the full picture down into it; FULL is the
- * whole target as before. Clipped to the rectangle. Every flip goes back to FULL. While views are in use the PC's
- * scene effects (ambient occlusion, reflections, ray tracing, DLSS, depth of field) are off. */
-enum { KG_VIEW_FULL, KG_VIEW_CROP, KG_VIEW_FIT };
-void kgpu_set_view(int mode, int x0, int y0, int x1, int y1);
+/* Split-screen (GPU thread, in draw order: kelvin_mark_view), for the rectangle x0, y0, x1, y1 of the 640x480 main
+ * target. FRAME: what follows is a whole frame of view `slot` (1 or 2), drawn on main-size surfaces of its own at the
+ * rectangle's share of the raster; at the next view (or the flip) its effects run as at the end of a frame, with that
+ * view's own history, and it is copied into the rectangle. FIT: the draws and clears that follow are scaled down into
+ * the rectangle (the HUD). FULL: the whole target as before. Every flip goes back to FULL. */
+enum { KG_VIEW_FULL, KG_VIEW_FRAME, KG_VIEW_FIT };
+void kgpu_set_view(int mode, int slot, int x0, int y0, int x1, int y1);
 
 /* AO position reconstruction: publish the real camera's horizontal/vertical
  * half-frustum after aspect, aim zoom and optional PC FOV. Invalid input disables

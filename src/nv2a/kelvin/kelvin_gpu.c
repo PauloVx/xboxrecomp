@@ -60,10 +60,10 @@ typedef struct VSG {
     float jit[4];                /* xy: this frame's DLAA offset, clip units per unit w (kelvin_gpu_dlss.inc) */
 } VSG;
 
-/* The split-screen view (kgpu_set_view); `seen`: this frame used one, `prev`: the frame before did. */
-static struct { int mode; float rect[4]; bool seen, prev; } s_view;
-
-static bool kg_split(void) { return s_view.seen || s_view.prev; }
+/* The split-screen view (kgpu_set_view). `slot`: the view whose own surfaces the main target's draws go to (0 none);
+ * `main`: the whole screen's main target; `cs`, `zs`: the view's; `seen`: this frame used views. */
+struct KGpuSurf;
+static struct { int mode, slot; float rect[4]; bool seen; struct KGpuSurf *main, *cs, *zs; } s_view;
 
 static volatile uint32_t s_vm_hash[8];
 static volatile int s_vm_count;
@@ -124,12 +124,13 @@ typedef struct VSConst {
 
 /* ---- state ----------------------------------------------------------------------- */
 
-#define KG_MAX_SURF 32
+#define KG_MAX_SURF 64
 #define KG_TEX_SLOTS 4096
 #define KG_STAGING 3
 
 typedef struct KGpuSurf {
     bool used, depth, swz;
+    int view;                     /* the split-screen view it belongs to (main-size surfaces only), 0 the whole screen */
     uint32_t va, pitch, format;
     unsigned int gw, gh, hw, hh, bpp;
     DXGI_FORMAT dxfmt;
@@ -873,6 +874,22 @@ static DXGI_FORMAT color_dxgi(unsigned int fmt, unsigned int *bpp)
     }
 }
 
+/* Split-screen: a view draws the main-size surfaces of its own, at its share of the screen. */
+static int surf_view(unsigned int gw, unsigned int gh) { return gw == 640 && gh == 480 ? s_view.slot : 0; }
+
+static void surf_main_size(int view, unsigned int *hw, unsigned int *hh)
+{
+    if (view) {
+        *hw = (unsigned int)(s_view.rect[2] * G.host_w / 640.0f) - (unsigned int)(s_view.rect[0] * G.host_w / 640.0f);
+        *hh = (unsigned int)(s_view.rect[3] * G.host_h / 480.0f) - (unsigned int)(s_view.rect[1] * G.host_h / 480.0f);
+    } else if (pc_split_enabled() && G.out_w > G.host_w && G.out_h > G.host_h) {
+        /* the views are brought up to the output size by DLSS before they go into it */
+        *hw = G.out_w; *hh = G.out_h;
+    } else {
+        *hw = G.host_w; *hh = G.host_h;
+    }
+}
+
 /* The GPU surface for the target's colour or zeta allocation, created on first
  * use. Full-screen guest targets (640x480, linear, no AA) render at host size. */
 static KGpuSurf *surf_get(const KelvinTarget *t, bool depth, unsigned int format)
@@ -883,18 +900,19 @@ static KGpuSurf *surf_get(const KelvinTarget *t, bool depth, unsigned int format
     DXGI_FORMAT fmt;
     KGpuSurf *s = NULL, *victim = NULL;
     D3D11_TEXTURE2D_DESC td;
+    const int view = surf_view(gw, gh);
     if (!va) return NULL;
     if (t->aa_x != 1 || t->aa_y != 1) {
         kelvin_unsupported(KU_SURFACE_FORMAT, "GPU surface with anti-aliasing", va);
         return NULL;
     }
-    if (gw == 640 && gh == 480) { hw = G.host_w; hh = G.host_h; } else { hw = gw; hh = gh; }
+    if (gw == 640 && gh == 480) surf_main_size(view, &hw, &hh); else { hw = gw; hh = gh; }
     fmt = depth ? DXGI_FORMAT_R32G8X24_TYPELESS : color_dxgi(format, &bpp);
     if (depth) bpp = 4;
     for (i = 0; i < KG_MAX_SURF; i++) {
         KGpuSurf *q = &G.surf[i];
         if (!q->used) { if (!s) s = q; continue; }
-        if (q->va == va && q->depth == depth) {
+        if (q->va == va && q->depth == depth && q->view == view) {
             if (q->pitch == pitch && q->gw == gw && q->gh == gh && q->format == format && q->swz == t->swizzled) {
                 q->clock = ++G.clock;
                 return q;
@@ -934,7 +952,7 @@ static KGpuSurf *surf_get(const KelvinTarget *t, bool depth, unsigned int format
         ID3D11Device_CreateRenderTargetView(G.dev, (ID3D11Resource *)s->tex, NULL, &s->rtv);
         ID3D11Device_CreateShaderResourceView(G.dev, (ID3D11Resource *)s->tex, NULL, &s->srv);
     }
-    s->used = true; s->depth = depth; s->swz = t->swizzled; s->va = va; s->pitch = pitch; s->format = format;
+    s->used = true; s->depth = depth; s->view = view; s->swz = t->swizzled; s->va = va; s->pitch = pitch; s->format = format;
     s->gw = gw; s->gh = gh; s->hw = hw; s->hh = hh; s->bpp = bpp; s->dxfmt = fmt;
     s->clock = ++G.clock;
     s_surf_gen++;
@@ -962,7 +980,7 @@ static KGpuSurf *surf_for_texture(const KTexture *t)
     unsigned int i;
     for (i = 0; i < KG_MAX_SURF; i++) {
         KGpuSurf *s = &G.surf[i];
-        if (!s->used || s->depth || s->va != t->base) continue;
+        if (!s->used || s->depth || s->va != t->base || s->view != surf_view(s->gw, s->gh)) continue;
         if (t->cubemap || t->levels != 1 || t->width != s->gw || t->height != s->gh) continue;
         if (s->swz) {
             /* a swizzled target sampled as a swizzled texture of the same shape: the layout is
@@ -983,7 +1001,7 @@ static KGpuSurf *surf_find(uint32_t va, bool depth)
     unsigned int i;
     for (i = 0; i < KG_MAX_SURF; i++) {
         KGpuSurf *s = &G.surf[i];
-        if (s->used && s->va == va && s->depth == depth) return s;
+        if (s->used && s->va == va && s->depth == depth && s->view == surf_view(s->gw, s->gh)) return s;
     }
     return NULL;
 }
@@ -1514,17 +1532,24 @@ static uint64_t s_cmp_frames;       /* flips seen by compare mode (G.frames only
 static bool readback(const KGpuSurf *cs, ID3D11Texture2D **stage_out, D3D11_MAPPED_SUBRESOURCE *ms);
 static void write_bmp(const char *path, const uint8_t *bgra, unsigned int w, unsigned int h, unsigned int pitch);
 
-/* The view's mapping of the main target `ref`, in guest pixels: p * s + (ox, oy). False when its draws are not mapped. */
+/* FIT's mapping of the main target `ref`, in guest pixels: p * s + (ox, oy). False when its draws are not mapped. */
 static bool kg_view_map(const KGpuSurf *ref, float *s, float *ox, float *oy)
 {
-    float rw, rh;
-    if (s_view.mode == KG_VIEW_FULL || !ref || ref->gw != 640 || ref->gh != 480) return false;
-    rw = s_view.rect[2] - s_view.rect[0];
-    rh = s_view.rect[3] - s_view.rect[1];
-    *s = s_view.mode == KG_VIEW_FIT ? fminf(rw / (float)ref->gw, rh / (float)ref->gh) : 1.0f;
+    if (s_view.mode != KG_VIEW_FIT || !ref || ref->gw != 640 || ref->gh != 480) return false;
+    *s = fminf((s_view.rect[2] - s_view.rect[0]) / (float)ref->gw, (s_view.rect[3] - s_view.rect[1]) / (float)ref->gh);
     *ox = (s_view.rect[0] + s_view.rect[2] - *s * (float)ref->gw) * 0.5f;
     *oy = (s_view.rect[1] + s_view.rect[3] - *s * (float)ref->gh) * 0.5f;
     return true;
+}
+
+/* The size the picture on `cs` is shown at: the output's, or a view's share of it. */
+static void kg_out_size(const KGpuSurf *cs, unsigned int *w, unsigned int *h)
+{
+    *w = G.out_w; *h = G.out_h;
+    if (cs && cs->view) {
+        *w = (unsigned int)(s_view.rect[2] * G.out_w / 640.0f) - (unsigned int)(s_view.rect[0] * G.out_w / 640.0f);
+        *h = (unsigned int)(s_view.rect[3] * G.out_h / 480.0f) - (unsigned int)(s_view.rect[1] * G.out_h / 480.0f);
+    }
 }
 
 #include "kelvin_gpu_post.inc"
@@ -1533,20 +1558,63 @@ static bool kg_view_map(const KGpuSurf *ref, float *s, float *ox, float *oy)
 #include "kelvin_gpu_rt.inc"
 #include "kelvin_gpu_dlss.inc"
 
-void kgpu_set_view(int mode, int x0, int y0, int x1, int y1)
+/* A view's world is drawn: its effects run as at the end of a whole frame's, and it goes into its share of the main
+ * target. The next world starts with fresh per-frame effect state. */
+static void kg_view_end(void)
 {
+    KGpuSurf *cs = s_view.cs, *zs = s_view.zs, *m = s_view.main;
+    if (cs && !(cs->used && cs->view == s_view.slot)) cs = zs = NULL;
+    if (zs && !(zs->used && zs->view == s_view.slot)) zs = NULL;
+    kg_rtc_end_frame(cs, zs);
+    kg_post_poll();
+    if (cs && s_post.scene_fx && !s_post.done && s_post.world >= 4) kg_post_scene(cs, zs);
+    if (cs && m && m->used && !m->view && !m->depth && m->gw == 640 && m->gh == 480 && m->dxfmt == cs->dxfmt) {
+        const unsigned int x0 = (unsigned int)(s_view.rect[0] * m->hw / 640.0f), y0 = (unsigned int)(s_view.rect[1] * m->hh / 480.0f);
+        const unsigned int x1 = (unsigned int)(s_view.rect[2] * m->hw / 640.0f), y1 = (unsigned int)(s_view.rect[3] * m->hh / 480.0f);
+        if (cs->hw == x1 - x0 && cs->hh == y1 - y0) {
+            D3D11_BOX box;
+            box.left = box.top = box.front = 0; box.right = cs->hw; box.bottom = cs->hh; box.back = 1;
+            ID3D11DeviceContext_CopySubresourceRegion(G.ctx, (ID3D11Resource *)m->tex, 0, x0, y0, 0, (ID3D11Resource *)cs->tex, 0, &box);
+            m->ver++; m->wseq = ++s_wseq;
+        } else {
+            static unsigned said;
+            if (said++ < 4) fprintf(stderr, "[KGPU] split-screen view %ux%u does not fit its %ux%u share\n", cs->hw, cs->hh, x1 - x0, y1 - y0);
+        }
+    }
+    kg_post_after_flip();
+    kg_dlss_view(s_view.slot, 0);
+    s_view.slot = 0;
+    s_view.cs = s_view.zs = NULL;
+    kg_cache_invalidate();
+}
+
+void kgpu_set_view(int mode, int slot, int x0, int y0, int x1, int y1)
+{
+    if (s_view.slot) kg_view_end();
     s_view.mode = mode;
     s_view.rect[0] = (float)x0; s_view.rect[1] = (float)y0;
     s_view.rect[2] = (float)x1; s_view.rect[3] = (float)y1;
+    if (mode == KG_VIEW_FRAME && slot > 0 && slot < KDLSS_SLOTS) {
+        s_view.slot = slot;
+        kg_dlss_view(0, slot);
+    } else if (mode == KG_VIEW_FIT && s_view.seen) {
+        /* the worlds are done: what follows is the HUD */
+        s_post.done = true;
+        s_rtc.done = true;
+    }
     if (mode != KG_VIEW_FULL) s_view.seen = true;
     kg_cache_invalidate();
 }
 
 /* At a flip: the next frame starts on the whole target. */
+static void kg_view_before_flip(void)
+{
+    if (s_view.slot) kg_view_end();
+}
+
 static void kg_view_after_flip(void)
 {
     pc_split_note_frame(s_view.seen);
-    s_view.prev = s_view.seen;
     s_view.seen = false;
     s_view.mode = KG_VIEW_FULL;
     kg_cache_invalidate();
@@ -1576,6 +1644,11 @@ static void kgpu_clear_now(const KelvinTarget *t, bool color, bool depth, bool s
                 (int)color, (int)depth, (int)stencil, x0, y0, x1, y1, t->width, t->height);
     if (cs) { cs->ver++; cs->wseq = ++s_wseq; }
     if (zs) { zs->real = true; zs->from_color = false; zs->ver++; zs->wseq = ++s_wseq; }
+    if (cs && cs->gw == 640 && cs->gh == 480) {
+        if (!s_view.slot) s_view.main = cs;
+        else s_view.cs = cs;
+    }
+    if (zs && s_view.slot && zs->gw == 640 && zs->gh == 480) s_view.zs = zs;
     {
         float vs, vx, vy;
         if (kg_view_map(cs ? cs : zs, &vs, &vx, &vy)) {
@@ -2098,6 +2171,7 @@ static void kg_apply_pending_size(void)
 
 static void kgpu_flip_now(const KelvinTarget *t, unsigned int color_format, uint32_t aspect_w, uint32_t aspect_h)
 {
+    kg_view_before_flip();
     kg_rtc_before_flip(t, color_format);
     kg_post_before_flip(t, color_format);
     kgpu_flip_inner(t, color_format, aspect_w, aspect_h);

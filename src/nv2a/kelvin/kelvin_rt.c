@@ -36,6 +36,7 @@
 
 #define KRT_RELEASE(p) do { if (p) { IUnknown_Release((IUnknown *)(p)); (p) = NULL; } } while (0)
 #define KRT_SLOTS 3
+#define KRT_HISTORIES 3
 #define KRT_DRAWS_MAX 4096u
 #define KRT_TEX_MAX 4096u
 #define KRT_TEX_PENDING 1024u
@@ -119,6 +120,10 @@ static struct {
     ID3D12Resource *history[2];         /* the lighting pass's, at the output's size */
     bool history_fresh;                 /* just made: nothing in it yet */
     ID3D12Resource *refl_raw, *refl_hist; /* the reflections before filtering, and the weapon's over frames */
+    /* Split-screen: each view's own history (the lighting pass's two, the reflections') and last camera, kept here
+     * while another view's frame is traced */
+    struct { ID3D12Resource *t[3]; float prev_vp[16]; bool have_prev, fresh, kept; } hist[KRT_HISTORIES];
+    int hist_cur;
     /* RECOMP_KGPU_RT_TIMES=1 (diagnostic): GPU time of each pass, averaged over 120 frames */
     int times;
     ID3D12QueryHeap *qheap;
@@ -744,9 +749,71 @@ void krt_tex_remove(int index)
 
 static void release_inputs(void)
 {
+    unsigned v, i;
     KRT_RELEASE(K.in_pic); KRT_RELEASE(K.in_w); KRT_RELEASE(K.in_g); KRT_RELEASE(K.in_depth);
     KRT_RELEASE(K.light_out); KRT_RELEASE(K.history[0]); KRT_RELEASE(K.history[1]);
     KRT_RELEASE(K.refl_raw); KRT_RELEASE(K.refl_hist);
+    for (v = 0; v < KRT_HISTORIES; v++) {
+        for (i = 0; i < 3; i++) KRT_RELEASE(K.hist[v].t[i]);
+        K.hist[v].kept = false;
+    }
+}
+
+/* A history texture: the lighting pass's two at half the output's size, the reflections' at its size. */
+static bool make_history(unsigned i, D3D12_RESOURCE_STATES state, ID3D12Resource **out)
+{
+    D3D12_HEAP_PROPERTIES hp;
+    D3D12_RESOURCE_DESC rd;
+    memset(&hp, 0, sizeof(hp));
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    memset(&rd, 0, sizeof(rd));
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = i < 2 ? (K.out_w + 1) / 2 : K.out_w;
+    rd.Height = i < 2 ? (K.out_h + 1) / 2 : K.out_h;
+    rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; rd.SampleDesc.Count = 1;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    return SUCCEEDED(ID3D12Device5_CreateCommittedResource(K.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd, state, NULL,
+                                                          &IID_ID3D12Resource, (void **)out));
+}
+
+static void copy_texture(ID3D12Resource *to, D3D12_RESOURCE_STATES to_state, ID3D12Resource *from, D3D12_RESOURCE_STATES from_state)
+{
+    barrier(to, to_state, D3D12_RESOURCE_STATE_COPY_DEST);
+    barrier(from, from_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    ID3D12GraphicsCommandList4_CopyResource(K.list, to, from);
+    barrier(to, D3D12_RESOURCE_STATE_COPY_DEST, to_state);
+    barrier(from, D3D12_RESOURCE_STATE_COPY_SOURCE, from_state);
+}
+
+/* Before the passes: the history in the working textures becomes `to`'s, the one they held is kept for its view. */
+static void switch_history(int to)
+{
+    ID3D12Resource *work[3];
+    int from = K.hist_cur;
+    unsigned i;
+    if (to < 0 || to >= KRT_HISTORIES || to == from) return;
+    work[0] = K.history[0]; work[1] = K.history[1]; work[2] = K.refl_hist;
+    for (i = 0; i < 3; i++) {
+        if (!work[i]) return;
+        if (!K.hist[from].t[i] && !make_history(i, D3D12_RESOURCE_STATE_COMMON, &K.hist[from].t[i])) return;
+    }
+    for (i = 0; i < 3; i++)
+        copy_texture(K.hist[from].t[i], D3D12_RESOURCE_STATE_COMMON, work[i], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    memcpy(K.hist[from].prev_vp, K.prev_vp, sizeof(K.prev_vp));
+    K.hist[from].have_prev = K.have_prev;
+    K.hist[from].fresh = K.history_fresh;
+    K.hist[from].kept = true;
+    if (K.hist[to].kept) {
+        for (i = 0; i < 3; i++)
+            copy_texture(work[i], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, K.hist[to].t[i], D3D12_RESOURCE_STATE_COMMON);
+        memcpy(K.prev_vp, K.hist[to].prev_vp, sizeof(K.prev_vp));
+        K.have_prev = K.hist[to].have_prev;
+        K.history_fresh = K.hist[to].fresh;
+    } else {
+        K.have_prev = false;
+        K.history_fresh = true;
+    }
+    K.hist_cur = to;
 }
 
 bool krt_set_inputs(HANDLE picture, HANDLE weight, HANDLE surface, HANDLE depth, HANDLE light)
@@ -921,6 +988,7 @@ bool krt_frame(const KrtFrame *f)
     if (moved) write_trace_tables();
 
     if (!open_list()) return false;
+    switch_history(f->history);
     /* What D3D11 wrote before this point -- the geometry texture -- is done once the fence passes this value. */
     ready = ++K.fence_value;
     ID3D11DeviceContext4_Signal(K.ctx11, K.fence11, ready);

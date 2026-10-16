@@ -145,8 +145,11 @@ static bool kg_dlss_run(KGpuSurf *cs, KGpuSurf *zs)
     for (i = 1; i < s_dlss.ncam; i++) if (s_dlss.cam[i].n > s_dlss.cam[best].n) best = i;
     if (!kg_rtc_inv4(s_dlss.cam[best].m, inv)) return false;
     {
-        const bool up = s_post.aa >= PCV_AA_DLSS_QUALITY && G.out_w > cs->hw && G.out_h > cs->hh && cs->gw == 640 && cs->gh == 480;
-        out_w = up ? G.out_w : cs->hw; out_h = up ? G.out_h : cs->hh;
+        unsigned int show_w, show_h;
+        bool up;
+        kg_out_size(cs, &show_w, &show_h);
+        up = s_post.aa >= PCV_AA_DLSS_QUALITY && show_w > cs->hw && show_h > cs->hh && cs->gw == 640 && cs->gh == 480;
+        out_w = up ? show_w : cs->hw; out_h = up ? show_h : cs->hh;
         ratio = (double)cs->hh / (double)out_h;
         quality = ratio > 0.99 ? KDLSS_DLAA : ratio > 0.64 ? KDLSS_QUALITY : ratio > 0.55 ? KDLSS_BALANCED : KDLSS_PERFORMANCE;
     }
@@ -217,6 +220,30 @@ static bool kg_dlss_run(KGpuSurf *cs, KGpuSurf *zs)
 }
 
 static const KGpuSurf *kg_dlss_swapped_surface(void) { return s_dlss.swapped; }
+
+/* Split-screen: each view's world keeps its own history (jitter sequence, last camera, the NGX feature). */
+typedef struct KgDlssHist {
+    unsigned phase, phases;
+    float shift[2], prev_m[16], prev_c58[4], prev_c59[4];
+    bool have_prev;
+    long long last_qpc;
+} KgDlssHist;
+static KgDlssHist s_dlss_hist[KDLSS_SLOTS];
+
+static void kg_dlss_view(int from, int to)
+{
+    KgDlssHist *h;
+    if (from == to || from < 0 || to < 0 || from >= KDLSS_SLOTS || to >= KDLSS_SLOTS) return;
+    h = &s_dlss_hist[from];
+    h->phase = s_dlss.phase; h->phases = s_dlss.phases; h->have_prev = s_dlss.have_prev; h->last_qpc = s_dlss.last_qpc;
+    memcpy(h->shift, s_dlss.shift, sizeof(h->shift)); memcpy(h->prev_m, s_dlss.prev_m, sizeof(h->prev_m));
+    memcpy(h->prev_c58, s_dlss.prev_c58, sizeof(h->prev_c58)); memcpy(h->prev_c59, s_dlss.prev_c59, sizeof(h->prev_c59));
+    h = &s_dlss_hist[to];
+    s_dlss.phase = h->phase; s_dlss.phases = h->phases; s_dlss.have_prev = h->have_prev; s_dlss.last_qpc = h->last_qpc;
+    memcpy(s_dlss.shift, h->shift, sizeof(h->shift)); memcpy(s_dlss.prev_m, h->prev_m, sizeof(h->prev_m));
+    memcpy(s_dlss.prev_c58, h->prev_c58, sizeof(h->prev_c58)); memcpy(s_dlss.prev_c59, h->prev_c59, sizeof(h->prev_c59));
+    kdlss_select(to);
+}
 
 /* Once after the swap: the draw that set it off recomputes its viewport and targets. */
 static bool kg_dlss_take_refresh(void)
