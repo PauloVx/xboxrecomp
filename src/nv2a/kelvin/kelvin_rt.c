@@ -99,7 +99,8 @@ static struct {
     ID3D12Resource *draws;              /* upload: KRT_SLOTS lists of each draw's first vertex, textures and flags */
     uint32_t *draws_cpu;
     ID3D12Resource *tex[KRT_TEX_MAX];   /* the game's textures, by index (krt_tex_add) */
-    struct { int index; uint64_t value; } pending[KRT_TEX_PENDING]; /* removed, released once the GPU passes value */
+    struct { int index; uint64_t value; } pending[KRT_TEX_PENDING]; /* removed, released once the GPU passes value
+                                                                     * (UINT64_MAX: the frame being captured may use it) */
     unsigned npending;
     ID3D12Resource *consts;             /* upload: 512 bytes a slot */
     uint8_t *consts_cpu;
@@ -555,6 +556,16 @@ bool krt_init(ID3D11Device *dev, ID3D11DeviceContext *ctx, LUID adapter_luid)
         ID3D12Debug *debug = NULL;
         if (get && SUCCEEDED(get(&IID_ID3D12Debug, (void **)&debug))) { ID3D12Debug_EnableDebugLayer(debug); ID3D12Debug_Release(debug); }
     }
+    if (getenv("RECOMP_KGPU_RT_DRED")) {
+        /* what the GPU was doing when the device is lost: reported by device_lost */
+        PfnGetDebug get = (PfnGetDebug)(void *)GetProcAddress(K.lib, "D3D12GetDebugInterface");
+        ID3D12DeviceRemovedExtendedDataSettings *dred = NULL;
+        if (get && SUCCEEDED(get(&IID_ID3D12DeviceRemovedExtendedDataSettings, (void **)&dred))) {
+            ID3D12DeviceRemovedExtendedDataSettings_SetAutoBreadcrumbsEnablement(dred, D3D12_DRED_ENABLEMENT_FORCED_ON);
+            ID3D12DeviceRemovedExtendedDataSettings_SetPageFaultEnablement(dred, D3D12_DRED_ENABLEMENT_FORCED_ON);
+            ID3D12DeviceRemovedExtendedDataSettings_Release(dred);
+        }
+    }
     if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory4, (void **)&factory)) ||
         FAILED(IDXGIFactory4_EnumAdapterByLuid(factory, adapter_luid, &IID_IDXGIAdapter1, (void **)&adapter))) {
         fprintf(stderr, "[KRT] the renderer's adapter is not visible to DXGI: ray tracing off\n");
@@ -661,13 +672,14 @@ bool krt_set_output(HANDLE texture, unsigned width, unsigned height)
     return true;
 }
 
-/* Removed textures whose last frame the GPU has finished: released, and their index free again. */
-static void release_textures(void)
+/* Removed textures whose last frame the GPU has finished: released, and their index free again. all: every one
+ * (nothing is in flight, and the frame being captured is not recorded yet). */
+static void release_textures(bool all)
 {
     const uint64_t done = ID3D12Fence_GetCompletedValue(K.fence);
     unsigned i = 0;
     while (i < K.npending) {
-        if (K.pending[i].value > done) { i++; continue; }
+        if (!all && K.pending[i].value > done) { i++; continue; }
         KRT_RELEASE(K.tex[K.pending[i].index]);
         null_tex(H_TEX + (unsigned)K.pending[i].index);
         K.pending[i] = K.pending[--K.npending];
@@ -679,7 +691,7 @@ int krt_tex_add(HANDLE texture)
     unsigned i;
     bool busy;
     if (!K.ok || !texture) return -1;
-    release_textures();
+    release_textures(false);
     for (i = 0; i < KRT_TEX_MAX; i++) {
         unsigned k;
         if (K.tex[i]) continue;
@@ -698,9 +710,9 @@ int krt_tex_add(HANDLE texture)
 void krt_tex_remove(int index)
 {
     if (!K.ok || index < 0 || index >= (int)KRT_TEX_MAX || !K.tex[index]) return;
-    if (K.npending == KRT_TEX_PENDING) { wait_fence(K.fence_value); release_textures(); }
+    if (K.npending == KRT_TEX_PENDING) { wait_fence(K.fence_value); release_textures(true); }
     K.pending[K.npending].index = index;
-    K.pending[K.npending].value = K.fence_value;
+    K.pending[K.npending].value = UINT64_MAX;
     K.npending++;
 }
 
@@ -764,12 +776,37 @@ bool krt_set_inputs(HANDLE picture, HANDLE weight, HANDLE surface, HANDLE depth,
 
 /* Grows a buffer for an acceleration structure (or its scratch) to at least `need`, with room to spare so a
  * slightly bigger frame does not grow it again. The GPU is idle first: a frame in flight may still use the old one. */
+/* With RECOMP_KGPU_RT_DRED: the operations (D3D12_AUTO_BREADCRUMB_OP) of each command list the GPU did not finish,
+ * the one it stopped at in [], and the address of a page fault. */
+static void report_dred(void)
+{
+    ID3D12DeviceRemovedExtendedData *d = NULL;
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT bc;
+    D3D12_DRED_PAGE_FAULT_OUTPUT pf;
+    const D3D12_AUTO_BREADCRUMB_NODE *node;
+    if (FAILED(ID3D12Device5_QueryInterface(K.dev, &IID_ID3D12DeviceRemovedExtendedData, (void **)&d))) return;
+    if (SUCCEEDED(ID3D12DeviceRemovedExtendedData_GetAutoBreadcrumbsOutput(d, &bc)))
+        for (node = bc.pHeadAutoBreadcrumbNode; node; node = node->pNext) {
+            UINT32 done = node->pLastBreadcrumbValue ? *node->pLastBreadcrumbValue : 0, i;
+            if (done >= node->BreadcrumbCount) continue;
+            fprintf(stderr, "[KRT] DRED: a list stopped after %u of %u operations:", done, node->BreadcrumbCount);
+            for (i = 0; i < node->BreadcrumbCount; i++) fprintf(stderr, i == done ? " [%d]" : " %d", (int)node->pCommandHistory[i]);
+            fprintf(stderr, "\n");
+        }
+    if (SUCCEEDED(ID3D12DeviceRemovedExtendedData_GetPageFaultAllocationOutput(d, &pf)) && pf.PageFaultVA)
+        fprintf(stderr, "[KRT] DRED: page fault at GPU address 0x%llx (%s)\n", (unsigned long long)pf.PageFaultVA,
+                pf.pHeadExistingAllocationNode ? "inside a live allocation" :
+                pf.pHeadRecentFreedAllocationNode ? "inside a freed allocation" : "outside any allocation");
+    ID3D12DeviceRemovedExtendedData_Release(d);
+}
+
 /* The device gone (a GPU fault or reset): ray tracing turned off for the rest of the run. */
 static bool device_lost(void)
 {
     HRESULT hr = ID3D12Device5_GetDeviceRemovedReason(K.dev);
     if (SUCCEEDED(hr)) return false;
     fprintf(stderr, "[KRT] the D3D12 device was lost (0x%08lX): ray tracing off\n", (unsigned long)hr);
+    report_dred();
     K.ok = false;
     return true;
 }
@@ -800,8 +837,8 @@ bool krt_frame(const KrtFrame *f)
     unsigned i, n, k, ns, group[2];
     bool moved = false, wrote = false;
 
-    if (!K.ok || !K.geo || !f->nverts || !f->ndraws || f->nverts > K.max_verts) return false;
-    release_textures();
+    if (!K.ok || device_lost() || !K.geo || !f->nverts || !f->ndraws || f->nverts > K.max_verts) return false;
+    release_textures(false);
     n = f->ndraws < KRT_DRAWS_MAX ? f->ndraws : KRT_DRAWS_MAX;
 
     /* The scene this frame: one geometry a draw, its triangles where the unpack pass puts them; the static draws
@@ -838,7 +875,6 @@ bool krt_frame(const KrtFrame *f)
     tl.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
     tl.NumDescs = 2;
     tl.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
-    tl.InstanceDescs = ID3D12Resource_GetGPUVirtualAddress(K.instance) + (UINT64)K.slot * 2 * sizeof(D3D12_RAYTRACING_INSTANCE_DESC);
     ID3D12Device5_GetRaytracingAccelerationStructurePrebuildInfo(K.dev, &tl, &tpi);
     scratch = tpi.ScratchDataSizeInBytes;
     for (k = 0; k < 2; k++) if (bpi[k].ScratchDataSizeInBytes > scratch) scratch = bpi[k].ScratchDataSizeInBytes;
@@ -903,8 +939,9 @@ bool krt_frame(const KrtFrame *f)
         memset(in, 0, sizeof(*in));
         in->Transform[0][0] = in->Transform[1][1] = in->Transform[2][2] = 1.0f;
         in->InstanceID = k ? ns : 0;
-        in->InstanceMask = group[k] ? (k ? 2 : 1) : 0;   /* an empty group is never hit */
-        in->AccelerationStructure = ID3D12Resource_GetGPUVirtualAddress(K.blas[k]);
+        /* an empty group's bottom level is not built this frame: the instance is inactive (no address) */
+        in->InstanceMask = group[k] ? (k ? 2 : 1) : 0;
+        in->AccelerationStructure = group[k] ? ID3D12Resource_GetGPUVirtualAddress(K.blas[k]) : 0;
     }
     cva = ID3D12Resource_GetGPUVirtualAddress(K.consts) + K.slot * 512;
 
@@ -946,6 +983,8 @@ bool krt_frame(const KrtFrame *f)
     }
     memset(&build, 0, sizeof(build));
     build.Inputs = tl;
+    /* this frame's instances: K.slot is this frame's only once open_list has run */
+    build.Inputs.InstanceDescs = ID3D12Resource_GetGPUVirtualAddress(K.instance) + (UINT64)K.slot * 2 * sizeof(D3D12_RAYTRACING_INSTANCE_DESC);
     build.DestAccelerationStructureData = ID3D12Resource_GetGPUVirtualAddress(K.tlas);
     build.ScratchAccelerationStructureData = ID3D12Resource_GetGPUVirtualAddress(K.scratch);
     ID3D12GraphicsCommandList4_BuildRaytracingAccelerationStructure(K.list, &build, 0, NULL);
@@ -1028,6 +1067,7 @@ bool krt_frame(const KrtFrame *f)
     }
     done = submit();
     K.alloc_done[K.slot] = done;
+    for (i = 0; i < K.npending; i++) if (K.pending[i].value == UINT64_MAX) K.pending[i].value = done;
     ID3D11DeviceContext4_Wait(K.ctx11, K.fence11, done);
     if (!K.said_frame) {
         K.said_frame = true;
