@@ -349,8 +349,11 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
 #define TD_CC_STALL    4u
 
 
-static uint32_t g_setup_pending;      /* wLength of the last SETUP seen */
-static UsbSetup g_setup;
+/* Each pad on the bus has its own control pipe. */
+static uint32_t g_setup_pending_[USB_GAMEPAD_MAX];   /* a SETUP awaits its data stage */
+static UsbSetup g_setup_[USB_GAMEPAD_MAX];
+#define g_setup_pending g_setup_pending_[pad]
+#define g_setup         g_setup_[pad]
 
 /* The control transfer's data stage, across however many descriptors it takes.
  *
@@ -361,9 +364,27 @@ static UsbSetup g_setup;
  * again, which is exactly the loop DDS9 sat in -- GET_DESCRIPTOR, SET_ADDRESS,
  * GET_DESCRIPTOR, forever. The answer is computed once per setup packet and
  * then consumed. */
-static uint8_t g_ctrl_buf[64];
-static int     g_ctrl_len = -1;   /* -1 = not answered yet */
-static int     g_ctrl_sent;
+static uint8_t g_ctrl_buf_[USB_GAMEPAD_MAX][64];
+static int     g_ctrl_len_[USB_GAMEPAD_MAX] = { -1, -1 };   /* -1 = not answered yet */
+static int     g_ctrl_sent_[USB_GAMEPAD_MAX];
+#define g_ctrl_buf  g_ctrl_buf_[pad]
+#define g_ctrl_len  g_ctrl_len_[pad]
+#define g_ctrl_sent g_ctrl_sent_[pad]
+
+/* Pads plugged in so far, in port order (RECOMP_USB_PADS, default 2: the second is split-screen's player two). */
+static int s_npads = 2, s_plugged_pads;
+
+/* The pad an endpoint descriptor talks to: by its function address; address 0, the default one a device answers
+ * before SET_ADDRESS, is the plugged pad not given an address yet (pads are plugged one at a time). */
+static int ohci_pad_for(uint32_t ed0)
+{
+    const uint32_t fa = ed0 & 0x7Fu;
+    int d;
+    for (d = 0; d < s_plugged_pads; d++)
+        if (fa ? usb_gamepad_address(d) == fa : usb_gamepad_address(d) == 0)
+            return d;
+    return -1;
+}
 
 /* Every address below came out of guest memory, so none of them are trusted.
  *
@@ -441,6 +462,10 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
     int      len  = (cbp && be >= cbp) ? (int)(be - cbp + 1) : 0;
     uint32_t endpoint = (ed0 >> 7) & 0xFu;
     int      moved = 0;
+    const int pad = ohci_pad_for(ed0);
+
+    if (pad < 0)
+        return TD_CC_NOERROR;   /* no device at that address */
 
     if (s_trace) {
         static unsigned n;
@@ -482,7 +507,7 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
             if (!g_setup_pending)
                 return TD_CC_NOERROR;
             if (g_ctrl_len < 0) {
-                g_ctrl_len = usb_gamepad_control(&g_setup, g_ctrl_buf,
+                g_ctrl_len = usb_gamepad_control(pad, &g_setup, g_ctrl_buf,
                                                  (int)sizeof g_ctrl_buf);
                 if (g_ctrl_len < 0) {
                     g_setup_pending = 0;
@@ -509,7 +534,7 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
         } else {
             /* The pad's report, on its interrupt endpoint. */
             uint8_t rep[32];
-            int n = usb_gamepad_report(rep, (int)sizeof rep);
+            int n = usb_gamepad_report(pad, rep, (int)sizeof rep);
             s_reports++;
             s_last_report_ms = GetTickCount64();
             if (n > len) n = len;
@@ -734,6 +759,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
      * because the fault was in the runtime rather than in the title. */
     unsigned waited = 0;
     int plugged = 0;
+    unsigned first_port = 0, settle = 0;
     uint32_t last_status = 0;
     unsigned repeats = 0, last_acks = 0;
 
@@ -782,9 +808,23 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
             hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
             plugged = 1;
+            s_plugged_pads = 1;
+            first_port = port;
             fprintf(stderr, "  [OHCI0] operational after %u ms; device "
                             "arriving on root port %u\n", waited * 20,
                     port + 1);
+            fflush(stderr);
+        }
+
+        /* The second pad arrives about a second after the first is configured, on the next root port, so the
+         * driver enumerates them in turn and only one device is ever at the default address. */
+        if (plugged && s_plugged_pads < s_npads && usb_gamepad_configured(s_plugged_pads - 1) && ++settle > 50) {
+            const unsigned port = (first_port + (unsigned)s_plugged_pads) % OHCI_PORTS;
+            hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
+            hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
+            s_plugged_pads++;
+            settle = 0;
+            fprintf(stderr, "  [OHCI0] pad %d arriving on root port %u\n", s_plugged_pads, port + 1);
             fflush(stderr);
         }
 
@@ -906,6 +946,10 @@ void xbox_OhciInit(void)
 
     s_enabled = 1;
     s_trace   = getenv("RECOMP_USB_TRACE") != NULL;
+    {
+        const char *pads = getenv("RECOMP_USB_PADS");
+        if (pads && *pads >= '1' && *pads <= '0' + USB_GAMEPAD_MAX) s_npads = *pads - '0';
+    }
     ohci_reset(&s_hc[0], XBOX_OHCI0_BASE, 0);
     ohci_reset(&s_hc[1], XBOX_OHCI1_BASE, 1);
 

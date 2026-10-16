@@ -31,12 +31,17 @@ typedef struct {
  * stall rather than as a short transfer, because those mean different things
  * to a driver.
  */
-int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max);
+/* Up to two pads: pad 0 is the host's own pad with the keyboard and mouse, pad 1 split-screen's second player
+ * (pc_split_pad_report). Each has its own address and configuration. */
+#define USB_GAMEPAD_MAX 2
+
+int usb_gamepad_control(int pad, const UsbSetup *setup, uint8_t *out, int max);
 
 /* Fill in the 20-byte input report. Returns the byte count written. */
-int usb_gamepad_report(uint8_t *out, int max);
+int usb_gamepad_report(int pad, uint8_t *out, int max);
 
 /* The address the host assigned with SET_ADDRESS, 0 until it does. */
-uint8_t usb_gamepad_address(void);
+uint8_t usb_gamepad_address(int pad);
+int usb_gamepad_configured(int pad);
 
 #endif /* XBOX_USB_GAMEPAD_H */

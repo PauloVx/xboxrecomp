@@ -47,10 +47,11 @@ static const uint8_t s_config_desc[32] = {
     7, 0x05, 0x02, 0x03, 0x20, 0x00, 0x04
 };
 
-static uint8_t s_address;
-static uint8_t s_configuration;
+static uint8_t s_address[USB_GAMEPAD_MAX];
+static uint8_t s_configuration[USB_GAMEPAD_MAX];
 
-uint8_t usb_gamepad_address(void) { return s_address; }
+uint8_t usb_gamepad_address(int pad) { return s_address[pad & 1]; }
+int usb_gamepad_configured(int pad) { return s_configuration[pad & 1] != 0; }
 
 /* ---- control transfers ------------------------------------------------- */
 
@@ -77,7 +78,7 @@ static int copy_out(uint8_t *out, int max, const uint8_t *src, int len,
     return len;
 }
 
-int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max)
+int usb_gamepad_control(int pad, const UsbSetup *setup, uint8_t *out, int max)
 {
     int is_in = (setup->bmRequestType & 0x80) != 0;
     int type  = (setup->bmRequestType >> 5) & 3;   /* 0 standard, 1 class */
@@ -102,16 +103,16 @@ int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max)
             }
 
         case REQ_SET_ADDRESS:
-            s_address = (uint8_t)(setup->wValue & 0x7F);
+            s_address[pad & 1] = (uint8_t)(setup->wValue & 0x7F);
             return 0;                    /* zero-length status stage */
 
         case REQ_SET_CONFIGURATION:
-            s_configuration = (uint8_t)(setup->wValue & 0xFF);
+            s_configuration[pad & 1] = (uint8_t)(setup->wValue & 0xFF);
             return 0;
 
         case REQ_GET_CONFIGURATION:
             if (!is_in || max < 1) return -1;
-            out[0] = s_configuration;
+            out[0] = s_configuration[pad & 1];
             return 1;
 
         case REQ_GET_STATUS:
@@ -193,6 +194,7 @@ int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max)
  * the same report (pc_input.c), so the game sees one pad whichever device is in use. */
 #include "../input/xinput_xbox.h"
 #include "../input/pc_input.h"
+#include "../video/pc_split.h"
 
 /* ---- scripted input ----------------------------------------------------- */
 
@@ -209,7 +211,8 @@ int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max)
  * BACK LTHUMB RTHUMB. The sticks, pushed all the way: LS_UP LS_DOWN LS_LEFT
  * LS_RIGHT, and RS_ the same. Example: "15000:START,17000:A,19000:DOWN,20000:A";
  * "60000:LS_UP+RS_RIGHT/2000" walks forward turning right for two seconds.
- * Each press is logged when it starts.
+ * Each press is logged when it starts. A "p2-" prefix makes a press the second pad's (split-screen's player two):
+ * "70000:p2-RT/500".
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -222,6 +225,7 @@ typedef struct PadPress {
     uint16_t digital;            /* wButtons bits                        */
     uint8_t analog;              /* bit i = bAnalogButtons[i] fully down */
     uint8_t sticks;              /* bit 2*axis, +1 if negative: pushed   */
+    uint8_t pad;                 /* 0 the first pad, 1 the second        */
     uint32_t logged;             /* last repeat index announced          */
 } PadPress;
 
@@ -290,6 +294,10 @@ static void pad_script_load(void)
         if (*end != ':')
             break;
         q = end + 1;
+        if ((q[0] == 'p' || q[0] == 'P') && q[1] == '2' && q[2] == '-') {
+            p->pad = 1;
+            q += 3;
+        }
         for (;;) {
             size_t n = strcspn(q, "+/*,");
             if (!pad_button(q, n, p)) {
@@ -314,7 +322,7 @@ static void pad_script_load(void)
 }
 
 /* Presses due now, merged into the report being built. */
-static void pad_script_apply(uint8_t *out)
+static void pad_script_apply(int pad, uint8_t *out)
 {
     uint64_t t;
     int i;
@@ -331,7 +339,7 @@ static void pad_script_apply(uint8_t *out)
         uint64_t since, k;
         int b;
 
-        if (t < p->start_ms)
+        if (p->pad != pad || t < p->start_ms)
             continue;
         since = t - p->start_ms;
         k = p->period_ms ? since / p->period_ms : 0;
@@ -343,8 +351,8 @@ static void pad_script_apply(uint8_t *out)
             continue;
         if (p->logged != (uint32_t)k) {
             p->logged = (uint32_t)k;
-            fprintf(stderr, "  [PAD] t=%llu ms: press %d (digital %02X analog"
-                            " %02X sticks %02X)\n", (unsigned long long)t, i,
+            fprintf(stderr, "  [PAD] t=%llu ms: press %d (pad %d digital %02X analog"
+                            " %02X sticks %02X)\n", (unsigned long long)t, i, pad + 1,
                     p->digital, p->analog, p->sticks);
             fflush(stderr);
         }
@@ -372,7 +380,7 @@ static void pad_script_apply(uint8_t *out)
  *   4..11  analog buttons A B X Y Black White, then the two triggers
  *   12..19 four signed 16-bit stick axes, little endian
  */
-int usb_gamepad_report(uint8_t *out, int max)
+int usb_gamepad_report(int pad, uint8_t *out, int max)
 {
     XBOX_INPUT_STATE state;
     const XBOX_GAMEPAD *g;
@@ -383,12 +391,17 @@ int usb_gamepad_report(uint8_t *out, int max)
     memset(out, 0, 20);
     out[0] = 0;
     out[1] = 20;
+    if (pad) {
+        pc_split_pad_report(out);
+        pad_script_apply(1, out);
+        return 20;
+    }
 
     /* A disconnected host pad is not an error here: the device is present on
      * the bus either way, it just reports nothing pressed -- apart from
      * anything scripted and whatever the keyboard and mouse are doing. */
     if (xbox_InputGetState(0, &state) != 0) {
-        pad_script_apply(out);
+        pad_script_apply(0, out);
         /* A configured script stands in for a connected controller, including mode filtering
          * and activity-driven prompts; it must enter the same merge as real XInput. */
         pc_input_apply_report(out, s_script_n > 0);
@@ -408,7 +421,7 @@ int usb_gamepad_report(uint8_t *out, int max)
     out[17] = (uint8_t)((g->sThumbRX >> 8) & 0xFF);
     out[18] = (uint8_t)(g->sThumbRY & 0xFF);
     out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
-    pad_script_apply(out);
+    pad_script_apply(0, out);
     pc_input_apply_report(out, 1);
     return 20;
 }
