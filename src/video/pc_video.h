@@ -9,7 +9,7 @@
  *   3. the RECOMP_* environment variables the diagnostics and lab scripts have always used
  *      (RECOMP_WINDOW_WIDTH/HEIGHT/MODE, RECOMP_RENDER_WIDTH/HEIGHT, RECOMP_SCALE_MODE,
  *      RECOMP_PRESENT_FILTER, RECOMP_VSYNC, RECOMP_FPS_LIMIT, RECOMP_BLACK_ASPECT,
- *      RECOMP_BLACK_FOV, RECOMP_BLACK_MOTION_BLUR, RECOMP_INTERNAL_HEIGHT). A variable that is
+ *      RECOMP_BLACK_FOV, RECOMP_BLACK_MOTION_BLUR, RECOMP_INTERNAL_HEIGHT, RECOMP_KGPU_RT). A variable that is
  *      set wins for the life of the process and its row in the menu is shown locked.
  *
  * The internal resolution is a number of lines (480p .. 2160p); the width follows from the
@@ -62,6 +62,7 @@ typedef struct PcVideoSettings {
     unsigned ao_method;                       /* ambient occlusion, PCV_AO_* */
     unsigned ao_quality;                      /* ambient occlusion sampling, PCV_AOQ_* */
     unsigned reflections;                     /* PCV_REFL_* */
+    unsigned ray_tracing;                     /* 1 = ray-traced effects (experimental), see pc_video_rt_support */
     unsigned render_override_w, render_override_h; /* both non-zero: an explicit raster size (RECOMP_RENDER_*) */
 } PcVideoSettings;
 
@@ -71,7 +72,8 @@ enum {
     PCV_LOCK_SCALE = 1u << 3, PCV_LOCK_FILTER = 1u << 4, PCV_LOCK_VSYNC = 1u << 5,
     PCV_LOCK_FPS = 1u << 6, PCV_LOCK_ASPECT = 1u << 7, PCV_LOCK_FOV = 1u << 8, PCV_LOCK_BLUR = 1u << 9,
     PCV_LOCK_AA = 1u << 10, PCV_LOCK_AF = 1u << 11, PCV_LOCK_DOF = 1u << 12, PCV_LOCK_SHARPEN = 1u << 13,
-    PCV_LOCK_AO_METHOD = 1u << 14, PCV_LOCK_AO_QUALITY = 1u << 15, PCV_LOCK_REFLECTIONS = 1u << 16
+    PCV_LOCK_AO_METHOD = 1u << 14, PCV_LOCK_AO_QUALITY = 1u << 15, PCV_LOCK_REFLECTIONS = 1u << 16,
+    PCV_LOCK_RAY_TRACING = 1u << 17
 };
 
 extern const unsigned pc_video_internal_heights[];   /* 480 .. 2160 */
@@ -118,6 +120,14 @@ int pc_video_motion_blur_off(void);
 typedef void (*PcVideoResizeHook)(unsigned raster_w, unsigned raster_h, unsigned out_w, unsigned out_h);
 void pc_video_set_resize_hook(PcVideoResizeHook hook);
 int pc_video_live_resize(void);
+
+/* Ray tracing needs a GPU with DirectX Raytracing and starts with the game: what the renderer can do with the setting.
+ * UNAVAILABLE without such a GPU (or a renderer that answers); LIVE when it is running, so the setting applies at
+ * once; RESTART when the game started without it. The renderer's query may take a moment the first time. */
+enum { PCV_RT_UNAVAILABLE, PCV_RT_LIVE, PCV_RT_RESTART };
+typedef int (*PcVideoRtSupport)(void);
+void pc_video_set_rt_support(PcVideoRtSupport query);
+int pc_video_rt_support(void);
 
 /* The settings file's text for these settings (also what the launcher and tests parse). */
 size_t pc_video_format(const PcVideoSettings *s, char *out, size_t cap);

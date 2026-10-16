@@ -20,6 +20,9 @@
  * unavailable: no d3d12.dll, no DXR, no compiled ray tracing shaders, or the two devices cannot share (as under some
  * Wine set-ups). */
 bool krt_init(ID3D11Device *dev, ID3D11DeviceContext *ctx, LUID adapter);
+/* Whether the adapter with this LUID could trace rays (DXR tier 1.1, and the shaders built in), without bringing
+ * anything up: a D3D12 device is made, asked and released. */
+bool krt_supported(LUID adapter);
 bool krt_available(void);
 void krt_shutdown(void);
 

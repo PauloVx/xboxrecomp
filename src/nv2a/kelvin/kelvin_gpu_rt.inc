@@ -210,6 +210,21 @@ static bool kg_rtc_setup(void)
     return true;
 }
 
+/* The Video Settings' switch (pc_video), read again only when the settings change. */
+static bool kg_rtc_wanted(void)
+{
+    static unsigned generation = ~0u;
+    static bool on;
+    const unsigned g = pc_video_generation();
+    if (g != generation) {
+        PcVideoSettings v;
+        pc_video_get(&v);
+        on = v.ray_tracing != 0;
+        generation = g;
+    }
+    return on;
+}
+
 static bool kg_rtc_on(void)
 {
     if (s_rtc.state == 0) s_rtc.state = kg_rtc_setup() ? 1 : -1;
@@ -238,7 +253,7 @@ static bool kg_rtc_begin(const KGpuDraw *d, const KgDc *dc, KGpuVs *ve, float zm
     uint32_t prims, i;
     UINT offset;
     if (!ve || !ve->so_gs || !d->gvs || !d->gvs->constants || !post_main_target(dc->cs) || !dc->zs || !ps->depth_write ||
-        s_rtc.done || kg_viewmodel_scale(d->gvs->hash) != 1.0f || !kg_rtc_on())
+        s_rtc.done || kg_viewmodel_scale(d->gvs->hash) != 1.0f || !kg_rtc_wanted() || !kg_rtc_on())
         return false;
     prims = kg_rtc_prims(d);
     if (!prims) return false;

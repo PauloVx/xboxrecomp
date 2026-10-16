@@ -537,6 +537,31 @@ static bool make_pipelines(void)
 #endif
 }
 
+bool krt_supported(LUID adapter_luid)
+{
+#ifdef KRT_HAVE_SHADERS
+    HMODULE lib = LoadLibraryA("d3d12.dll");
+    PfnCreateDevice create = lib ? (PfnCreateDevice)(void *)GetProcAddress(lib, "D3D12CreateDevice") : NULL;
+    IDXGIFactory4 *factory = NULL;
+    IDXGIAdapter1 *adapter = NULL;
+    ID3D12Device5 *dev = NULL;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS5 o5;
+    bool ok = false;
+    if (create && SUCCEEDED(CreateDXGIFactory1(&IID_IDXGIFactory4, (void **)&factory)) &&
+        SUCCEEDED(IDXGIFactory4_EnumAdapterByLuid(factory, adapter_luid, &IID_IDXGIAdapter1, (void **)&adapter)) &&
+        SUCCEEDED(create((IUnknown *)adapter, D3D_FEATURE_LEVEL_12_0, &IID_ID3D12Device5, (void **)&dev))) {
+        memset(&o5, 0, sizeof(o5));
+        ok = SUCCEEDED(ID3D12Device5_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS5, &o5, sizeof(o5))) &&
+             o5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_1;
+    }
+    KRT_RELEASE(dev); KRT_RELEASE(adapter); KRT_RELEASE(factory);
+    return ok;
+#else
+    (void)adapter_luid;
+    return false;
+#endif
+}
+
 bool krt_init(ID3D11Device *dev, ID3D11DeviceContext *ctx, LUID adapter_luid)
 {
     PfnCreateDevice create;

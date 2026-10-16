@@ -396,6 +396,21 @@ static void kgpu_request_host_size(unsigned int w, unsigned int h, unsigned int 
 
 static void kgpu_vs_precompile(void);
 
+static LUID s_rt_luid;
+static bool s_rt_started;          /* the settings asked for ray tracing at start */
+static volatile LONG s_rt_probe = -1; /* krt_supported's answer once asked (0 or 1) */
+
+/* pc_video_rt_support: what the Video Settings' ray tracing switch can do here. */
+static int kgpu_rt_support(void)
+{
+    LONG p;
+    if (krt_available()) return PCV_RT_LIVE;
+    if (s_rt_started) return PCV_RT_UNAVAILABLE;           /* asked for at start, and it could not come up */
+    p = InterlockedCompareExchange(&s_rt_probe, -1, -1);
+    if (p < 0) { p = krt_supported(s_rt_luid) ? 1 : 0; InterlockedExchange(&s_rt_probe, p); }
+    return p ? PCV_RT_RESTART : PCV_RT_UNAVAILABLE;
+}
+
 bool kgpu_init(void)
 {
     IDXGIFactory1 *factory = NULL;
@@ -467,7 +482,15 @@ bool kgpu_init(void)
     IDXGIAdapter1_Release(best);
     if (FAILED(hr)) { fprintf(stderr, "[KGPU] D3D11CreateDevice failed 0x%08lX\n", (unsigned long)hr); return false; }
     ID3D11DeviceContext_QueryInterface(G.ctx, &IID_ID3D11DeviceContext1, (void **)&G.ctx1);
-    if (getenv("RECOMP_KGPU_RT")) krt_init(G.dev, G.ctx, best_luid);
+    {
+        /* ray tracing (experimental) starts with the game when the Video Settings ask for it */
+        PcVideoSettings vs;
+        pc_video_get(&vs);
+        s_rt_luid = best_luid;
+        s_rt_started = vs.ray_tracing != 0;
+        if (s_rt_started) krt_init(G.dev, G.ctx, best_luid);
+        pc_video_set_rt_support(kgpu_rt_support);
+    }
 
     vsb = compile_hlsl(kgpu_hlsl_common, kgpu_hlsl_vs, "vs_main", "vs_5_0");
     psb = compile_hlsl(kgpu_hlsl_common, kgpu_hlsl_ps, "ps_main", "ps_5_0");
