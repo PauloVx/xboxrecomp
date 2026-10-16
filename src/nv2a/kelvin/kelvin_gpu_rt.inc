@@ -26,6 +26,8 @@ typedef struct KrtCapDraw {
     uint32_t rt_tex[2], rt_flags;       /* for the D3D12 side: texture indices and KRT_* flags */
     bool sh;
     float sh_l1[3];                     /* lit by ambient coefficients: their linear term, in the model's space */
+    bool skinned;                       /* its program blends bones: a character */
+    uint64_t key;                       /* the same model from one frame to the next: its vertices, program, count */
     float m[16];                        /* the program's c[10..13] */
     bool raw_ok;
     float raw[3];                       /* the first vertex's input position, for the check */
@@ -64,6 +66,9 @@ static struct {
     float light[3];                     /* towards the main light, smoothed over frames */
     bool have_light;
     float shadow, ao, ao_radius, gi;    /* strengths (RECOMP_KGPU_RT_SHADOW/_AO/_GI, 0 off) */
+    uint64_t frame;
+    /* what has a transform of its own, by key: its last world transform and when it last moved */
+    struct { uint64_t key, moved, seen; float world[12]; } models[8192];
     bool reflect;                       /* ray-traced reflections (RECOMP_KGPU_RT_REFL=0 turns them off) */
     uint32_t first[KRT_DRAWS_MAX], count[KRT_DRAWS_MAX], tex0[KRT_DRAWS_MAX], tex1[KRT_DRAWS_MAX], flags[KRT_DRAWS_MAX];
 } s_rtc;
@@ -267,6 +272,14 @@ static bool kg_rtc_begin(const KGpuDraw *d, const KgDc *dc, KGpuVs *ve, float zm
                  strstr(ve->source, "(C[5].xyz") ? 2 : 1;
     }
     if (ve->rt_sh == 2) { r->sh = true; memcpy(r->sh_l1, c + 4 * 4, sizeof(r->sh_l1)); }
+    if (!ve->rt_skin) ve->rt_skin = ve->source && strstr(ve->source, "+ (int)a0,") ? 2 : 1;   /* bones by relative address */
+    r->skinned = ve->rt_skin == 2;
+    {
+        const KGpuAttrSrc *a = &d->gvs->attr[0];
+        uint64_t k = (uint64_t)(uintptr_t)a->data * 0x9E3779B97F4A7C15ull;
+        k ^= ((uint64_t)d->gvs->hash << 32) ^ (uint64_t)d->icount * 0xC2B2AE3D27D4EB4Full ^ d->indices[0];
+        r->key = k ? k : 1;
+    }
     memcpy(r->m, c + 4 * 10, sizeof(r->m));
     {
         const KGpuAttrSrc *a = &d->gvs->attr[0];
@@ -510,6 +523,39 @@ static bool kg_rtc_inv4(const float *m, double *inv)
     return true;
 }
 
+/* Whether a draw with a transform of its own is dynamic: a character (its program blends bones), or a model that
+ * moved in the last two seconds. A model that stays put -- a tree, a crate, rubble -- is in the lightmaps already,
+ * its shadow too, so it is left to them. */
+static bool kg_rtc_dynamic(const KrtCapDraw *r, const double *ivp)
+{
+    float world[12];
+    unsigned j, k, slot, probe;
+    if (r->skinned) return true;
+    for (j = 0; j < 3; j++)
+        for (k = 0; k < 4; k++)
+            world[j * 4 + k] = (float)(ivp[j * 4 + 0] * r->m[0 * 4 + k] + ivp[j * 4 + 1] * r->m[1 * 4 + k] +
+                                       ivp[j * 4 + 2] * r->m[2 * 4 + k] + ivp[j * 4 + 3] * r->m[3 * 4 + k]);
+    slot = (unsigned)(r->key % 8192u);
+    for (probe = 0; probe < 16; probe++, slot = (slot + 1) % 8192u) {
+        if (s_rtc.models[slot].key == r->key) break;
+        if (!s_rtc.models[slot].key || s_rtc.frame - s_rtc.models[slot].seen > 600) {
+            s_rtc.models[slot].key = r->key;
+            s_rtc.models[slot].moved = 0;
+            memcpy(s_rtc.models[slot].world, world, sizeof(world));
+            s_rtc.models[slot].seen = s_rtc.frame;
+            return false;
+        }
+    }
+    if (probe == 16) return false;
+    for (j = 0; j < 12; j++) {
+        const float tol = (j % 4) == 3 ? 0.01f : 0.002f;   /* translation in world units, rotation in cosines */
+        if (fabsf(world[j] - s_rtc.models[slot].world[j]) > tol) { s_rtc.models[slot].moved = s_rtc.frame; break; }
+    }
+    memcpy(s_rtc.models[slot].world, world, sizeof(world));
+    s_rtc.models[slot].seen = s_rtc.frame;
+    return s_rtc.models[slot].moved && s_rtc.frame - s_rtc.models[slot].moved < 240;
+}
+
 /* The main light: BLACK bakes its lighting, but the ambient coefficients that light its props and characters have a
  * linear term pointing at where most light comes from. Each such draw's, turned from its model's space into the
  * world (the camera's inverse times its own matrix), summed and smoothed over frames. */
@@ -549,6 +595,8 @@ static void kg_rtc_light(const float *vp)
 static void kg_rtc_finish(KGpuSurf *cs, KGpuSurf *zs)
 {
     const float *vp;
+    double ivp[16];
+    bool have_ivp;
     KrtCb cb;
     KrtFrame f;
     D3D11_MAPPED_SUBRESOURCE ms;
@@ -577,13 +625,16 @@ static void kg_rtc_finish(KGpuSurf *cs, KGpuSurf *zs)
     if (s_rtc.check && ++s_rtc.frames % 300 == 0) kg_rtc_check(vp);
 
     memset(&f, 0, sizeof(f));
+    s_rtc.frame++;
+    have_ivp = kg_rtc_inv4(vp, ivp);
     for (i = 0; i < s_rtc.ndraws; i++) {
         s_rtc.first[i] = s_rtc.draws[i].first;
         s_rtc.count[i] = s_rtc.draws[i].count;
         s_rtc.tex0[i] = s_rtc.draws[i].rt_tex[0];
         s_rtc.tex1[i] = s_rtc.draws[i].rt_tex[1];
         s_rtc.flags[i] = s_rtc.draws[i].rt_flags;
-        if (memcmp(s_rtc.draws[i].m, vp, sizeof(s_rtc.draws[i].m)) != 0) s_rtc.flags[i] |= KRT_DYNAMIC;
+        if (memcmp(s_rtc.draws[i].m, vp, sizeof(s_rtc.draws[i].m)) != 0 && have_ivp && kg_rtc_dynamic(&s_rtc.draws[i], ivp))
+            s_rtc.flags[i] |= KRT_DYNAMIC;
     }
     f.nverts = s_rtc.used; f.ndraws = s_rtc.ndraws;
     f.first = s_rtc.first; f.count = s_rtc.count; f.tex0 = s_rtc.tex0; f.tex1 = s_rtc.tex1; f.flags = s_rtc.flags;
@@ -640,9 +691,16 @@ static void kg_rtc_note_draw(const KPixelState *ps, const KGpuSurf *cs, KGpuSurf
         kg_rtc_finish((KGpuSurf *)cs, zs);
 }
 
-static void kg_rtc_before_flip(void)
+/* At the flip: a frame with no HUD (photo mode, some cut scenes) has its effects now, on the target it shows. */
+static void kg_rtc_before_flip(const KelvinTarget *t, unsigned int color_format)
 {
-    kg_rtc_finish(NULL, NULL);
+    KGpuSurf *cs = NULL, *zs = NULL;
+    if (s_rtc.state > 0 && !s_rtc.done && s_rtc.ndraws >= 4) {
+        cs = surf_get(t, false, color_format);
+        zs = t->zeta_va ? surf_find(t->zeta_va, true) : NULL;
+        if (!post_main_target(cs)) cs = zs = NULL;
+    }
+    kg_rtc_finish(cs, zs);
     s_rtc.used = 0;
     s_rtc.ndraws = 0;
     s_rtc.overflow = false;

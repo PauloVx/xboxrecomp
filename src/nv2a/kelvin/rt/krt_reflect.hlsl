@@ -49,8 +49,16 @@ void main(uint3 id : SV_DispatchThreadID)
     rr.TMin = 0.0;
     rr.TMax = 1.0e5;
     if (abs(here - drawn) > 0.02 * drawn + 0.05) {
-        // not the scene's: the weapon
-        float3 N = view_to_world(drawn_at.yzw);
+        // not the scene's: the weapon. Its normals come from screen derivatives, a pixel's worth of noise: averaged
+        // over the weapon's pixels around this one at about its depth.
+        float3 nv = 0.0;
+        [unroll] for (int y = -2; y <= 2; y++)
+            [unroll] for (int x = -2; x <= 2; x++) {
+                int2 q = clamp(int2(id.xy) + int2(x, y) * 2, int2(0, 0), int2(size.xy) - 1);
+                float4 s = surface.Load(int3(q, 0));
+                if (abs(view_w_from_depth(s.x) - drawn) < 0.05 * drawn + 0.01 && dot(s.yzw, s.yzw) > 0.0) nv += normalize(s.yzw);
+            }
+        float3 N = view_to_world(dot(nv, nv) > 0.0 ? nv : drawn_at.yzw);
         rr.Direction = reflect(cr.Direction, N);
         rr.Origin = cr.Origin + cr.Direction * 0.3;
         kind = 3.0;

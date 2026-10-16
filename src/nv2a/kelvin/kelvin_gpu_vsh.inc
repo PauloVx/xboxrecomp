@@ -447,6 +447,7 @@ typedef struct KGpuVs {
     unsigned env;                      /* the stages its texture coordinates give environment maps (vsh_env_stages) */
     ID3D11GeometryShader *volatile so_gs; /* ray tracing: the same program streaming its triangles out (kelvin_gpu_rt.inc) */
     int rt_sh;                         /* ray tracing: lit by ambient coefficients? 0 not known yet, 1 no, 2 yes */
+    int rt_skin;                       /* ray tracing: blends bones? 0 not known yet, 1 no, 2 yes */
 } KGpuVs;
 
 /* A vertex shader's outputs streamed as they are rasterised: position, diffuse colour and the first two texture

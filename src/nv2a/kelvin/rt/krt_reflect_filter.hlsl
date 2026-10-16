@@ -31,7 +31,7 @@ void main(uint3 id : SV_DispatchThreadID)
     float3 c = sum / max(total, 1e-4);
     if (me.a > 2.5) {
         float4 old = history[id.xy];
-        if (old.a > 0.5) c = lerp(c, old.rgb, 0.8);
+        if (old.a > 0.5) c = lerp(c, old.rgb, 0.9);
         history[id.xy] = float4(c, 1.0);
     } else {
         history[id.xy] = 0.0;

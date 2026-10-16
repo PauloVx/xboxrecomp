@@ -2017,7 +2017,7 @@ static void kg_apply_pending_size(void)
 
 static void kgpu_flip_now(const KelvinTarget *t, unsigned int color_format, uint32_t aspect_w, uint32_t aspect_h)
 {
-    kg_rtc_before_flip();
+    kg_rtc_before_flip(t, color_format);
     kg_post_before_flip(t, color_format);
     kgpu_flip_inner(t, color_format, aspect_w, aspect_h);
     kg_post_after_flip();
