@@ -8,7 +8,7 @@
 //
 // At half the output's width and height, a different one of each 2x2 block's pixels each frame: one shadow ray and two
 // occlusion rays, averaged over frames. The history is last frame's result where this pixel's surface was then (last
-// frame's camera), kept if it was the same surface. The composite scales the result up.
+// frame's camera), kept if it was the same surface. krt_light_filter.hlsl smooths it; the composite scales it up.
 #include "krt_common.hlsli"
 
 Texture2D<float> depth : register(t8);      // the frame's depth buffer
@@ -77,7 +77,7 @@ void main(uint3 id : SV_DispatchThreadID)
             float ndl = dot(N, light.xyz);
             if (light.w > 0.0 && ndl > 0.0) {
                 // a soft edge: the light a little wider than a point, a different direction in it each frame
-                float3 L = normalize(light.xyz + (cosine_dir(light.xyz, u) - light.xyz) * 0.035);
+                float3 L = normalize(light.xyz + (cosine_dir(light.xyz, u) - light.xyz) * 0.02);
                 RayDesc sr;
                 sr.Origin = O; sr.Direction = L; sr.TMin = 0.0; sr.TMax = 300.0;
                 if (occluded(sr, mask)) shadow = 1.0 - light.w * saturate(ndl * 2.0);
@@ -115,9 +115,8 @@ void main(uint3 id : SV_DispatchThreadID)
         if (prev_pixel(P, pq, w)) {
             uint2 hq = min((uint2)(pq * 0.5), half_size - 1u);
             float4 old = odd ? history_b[hq] : history_a[hq];
-            if (old.a > 0.0 && abs(old.a - w) < 0.05 * w + 0.1) result.rgb = lerp(now.rgb, old.rgb, 0.85);
+            if (old.a > 0.0 && abs(old.a - w) < 0.05 * w + 0.1) result.rgb = lerp(now.rgb, old.rgb, 0.9);
         }
     }
-    if (odd) history_a[id.xy] = result; else history_b[id.xy] = result;
-    light_out[id.xy] = float4(result.rgb, 1.0);
+    if (odd) history_a[id.xy] = result; else history_b[id.xy] = result;   /* krt_light_filter.hlsl makes light_out */
 }

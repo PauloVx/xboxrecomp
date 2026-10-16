@@ -44,7 +44,7 @@ if(WIN32)
     if(KRT_DXC)
         set(_krt_out ${CMAKE_CURRENT_BINARY_DIR}/krt_shaders)
         set(_krt_headers)
-        foreach(_krt_name krt_unpack krt_view krt_reflect krt_calibrate krt_calib_update krt_light krt_reflect_filter)
+        foreach(_krt_name krt_unpack krt_view krt_reflect krt_calibrate krt_calib_update krt_light krt_reflect_filter krt_light_filter)
             set(_krt_h ${_krt_out}/${_krt_name}.h)
             add_custom_command(
                 OUTPUT ${_krt_h}

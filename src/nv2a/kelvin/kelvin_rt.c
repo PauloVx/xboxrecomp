@@ -31,6 +31,7 @@
 #include "krt_calib_update.h"
 #include "krt_light.h"
 #include "krt_reflect_filter.h"
+#include "krt_light_filter.h"
 #endif
 
 #define KRT_RELEASE(p) do { if (p) { IUnknown_Release((IUnknown *)(p)); (p) = NULL; } } while (0)
@@ -85,7 +86,7 @@ static struct {
     uint64_t fence_value;
 
     ID3D12RootSignature *root;
-    ID3D12PipelineState *pso_unpack, *pso_view, *pso_reflect, *pso_calibrate, *pso_calib_update, *pso_light, *pso_reflect_filter;
+    ID3D12PipelineState *pso_unpack, *pso_view, *pso_reflect, *pso_calibrate, *pso_calib_update, *pso_light, *pso_reflect_filter, *pso_light_filter;
     ID3D12Resource *sums, *factors;     /* the brightness calibration's sums and its factors */
     uint64_t frame;
     ID3D12DescriptorHeap *heap;
@@ -287,7 +288,7 @@ void krt_shutdown(void)
     release_inputs();
     KRT_RELEASE(K.draws); KRT_RELEASE(K.consts); KRT_RELEASE(K.instance);
     KRT_RELEASE(K.pso_unpack); KRT_RELEASE(K.pso_view); KRT_RELEASE(K.pso_reflect);
-    KRT_RELEASE(K.pso_calibrate); KRT_RELEASE(K.pso_calib_update); KRT_RELEASE(K.pso_light); KRT_RELEASE(K.pso_reflect_filter); KRT_RELEASE(K.sums); KRT_RELEASE(K.factors); KRT_RELEASE(K.root); KRT_RELEASE(K.heap);
+    KRT_RELEASE(K.pso_calibrate); KRT_RELEASE(K.pso_calib_update); KRT_RELEASE(K.pso_light); KRT_RELEASE(K.pso_reflect_filter); KRT_RELEASE(K.pso_light_filter); KRT_RELEASE(K.sums); KRT_RELEASE(K.factors); KRT_RELEASE(K.root); KRT_RELEASE(K.heap);
     KRT_RELEASE(K.list);
     for (i = 0; i < KRT_SLOTS; i++) KRT_RELEASE(K.alloc[i]);
     KRT_RELEASE(K.qread); KRT_RELEASE(K.qheap); K.times = 0;
@@ -498,8 +499,9 @@ static bool make_pipelines(void)
     K.pso_calib_update = make_pso(krt_calib_update_cs, sizeof(krt_calib_update_cs));
     K.pso_light = make_pso(krt_light_cs, sizeof(krt_light_cs));
     K.pso_reflect_filter = make_pso(krt_reflect_filter_cs, sizeof(krt_reflect_filter_cs));
+    K.pso_light_filter = make_pso(krt_light_filter_cs, sizeof(krt_light_filter_cs));
     if (!K.pso_unpack || !K.pso_view || !K.pso_reflect || !K.pso_calibrate || !K.pso_calib_update || !K.pso_light ||
-        !K.pso_reflect_filter) { fprintf(stderr, "[KRT] compute pipelines failed\n"); return false; }
+        !K.pso_reflect_filter || !K.pso_light_filter) { fprintf(stderr, "[KRT] compute pipelines failed\n"); return false; }
 
     memset(&hd, 0, sizeof(hd));
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = H_COUNT;
@@ -762,6 +764,16 @@ bool krt_set_inputs(HANDLE picture, HANDLE weight, HANDLE surface, HANDLE depth,
 
 /* Grows a buffer for an acceleration structure (or its scratch) to at least `need`, with room to spare so a
  * slightly bigger frame does not grow it again. The GPU is idle first: a frame in flight may still use the old one. */
+/* The device gone (a GPU fault or reset): ray tracing turned off for the rest of the run. */
+static bool device_lost(void)
+{
+    HRESULT hr = ID3D12Device5_GetDeviceRemovedReason(K.dev);
+    if (SUCCEEDED(hr)) return false;
+    fprintf(stderr, "[KRT] the D3D12 device was lost (0x%08lX): ray tracing off\n", (unsigned long)hr);
+    K.ok = false;
+    return true;
+}
+
 static bool ensure_as(ID3D12Resource **r, UINT64 *size, UINT64 need, bool scratch)
 {
     if (*r && *size >= need) return true;
@@ -837,7 +849,11 @@ bool krt_frame(const KrtFrame *f)
         !ensure_as(&K.blas[1], &K.blas_size[1], bpi[1].ResultDataMaxSizeInBytes + 256, false) ||
         !ensure_as(&K.tlas, &K.tlas_size, tpi.ResultDataMaxSizeInBytes, false) ||
         !ensure_as(&K.scratch, &K.scratch_size, scratch, true)) {
-        fprintf(stderr, "[KRT] acceleration structure memory failed\n");
+        static unsigned reported;
+        if (!device_lost() && reported++ < 3)
+            fprintf(stderr, "[KRT] acceleration structure memory failed: %u draws, %u vertices, %llu + %llu + %llu KiB\n", n, f->nverts,
+                    (unsigned long long)(bpi[0].ResultDataMaxSizeInBytes >> 10), (unsigned long long)(bpi[1].ResultDataMaxSizeInBytes >> 10),
+                    (unsigned long long)(scratch >> 10));
         return false;
     }
     if (moved) write_trace_tables();
@@ -959,6 +975,10 @@ bool krt_frame(const KrtFrame *f)
         ID3D12GraphicsCommandList4_SetComputeRootDescriptorTable(K.list, 2, gpu_handle(H_TRACE_UAV));
         barrier(K.in_depth, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         barrier(K.light_out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        ID3D12GraphicsCommandList4_Dispatch(K.list, ((K.out_w + 1) / 2 + 7) / 8, ((K.out_h + 1) / 2 + 7) / 8, 1);
+        uav_barrier(K.history[0]);
+        uav_barrier(K.history[1]);
+        ID3D12GraphicsCommandList4_SetPipelineState(K.list, K.pso_light_filter);
         ID3D12GraphicsCommandList4_Dispatch(K.list, ((K.out_w + 1) / 2 + 7) / 8, ((K.out_h + 1) / 2 + 7) / 8, 1);
         barrier(K.light_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
         barrier(K.in_depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
