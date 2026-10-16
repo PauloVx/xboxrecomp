@@ -33,6 +33,9 @@ static struct {
     int dump_init;
     char dump[MAX_PATH];
     unsigned long long dump_at;
+    /* ray-traced reflections this frame (kelvin_gpu_rt.inc): rgb a colour, a = 0 not traced, 1 no colour, 2 a hit */
+    ID3D11ShaderResourceView *rt_srv;
+    bool rt_valid;
 } s_ssr;
 
 static void ssr_free_targets(void)
@@ -169,18 +172,26 @@ static void ssr_dump_weight(unsigned int w, unsigned int h)
 static void kg_ssr_pass(KGpuSurf *cs, KGpuSurf *zs)
 {
     static const float steps[4] = { 24, 40, 64, 96 };
-    ID3D11ShaderResourceView *in[8], *none[8] = { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
+    ID3D11ShaderResourceView *in[9], *none[9] = { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
     ID3D11SamplerState *smp[2];
     D3D11_MAPPED_SUBRESOURCE ms;
     KgPostCb c;
     int q = s_ssr_setting;
     bool dumping;
+    const bool rt = s_ssr.rt_valid && s_ssr.rt_srv;
+    s_ssr.rt_valid = false;
     if (!s_ssr.used) return;
     s_ssr.used = false;
     if (q < 1 || !s_ssr.ok || !zs || !zs->depth || !zs->real || !zs->srv || zs->hw != cs->hw || zs->hh != cs->hh ||
         s_ssr.w != cs->hw || s_ssr.h != cs->hh || !ssr_blur(cs->hw, cs->hh)) { ssr_clear(); return; }
     memset(&c, 0, sizeof(c));
     if (!kg_ao_camera(s_post.ao_camera, &c.p3[0], &c.p3[1])) { ssr_clear(); return; }
+    c.p3[2] = rt ? 1.0f : 0.0f;
+    {
+        static int dbg = -1;
+        if (dbg < 0) { const char *e = getenv("RECOMP_KGPU_RT_REFL_DEBUG"); dbg = e && *e && *e != '0'; }
+        c.p3[3] = rt && dbg ? 1.0f : 0.0f;
+    }
     if (q > 4) q = 4;
     c.p0[0] = 1.0f / cs->hw; c.p0[1] = 1.0f / cs->hh; c.p0[2] = (float)cs->hw; c.p0[3] = (float)cs->hh;
     c.p1[0] = steps[q - 1]; c.p1[1] = 1.6f; c.p1[2] = 0.06f; c.p1[3] = s_ssr_strength;
@@ -212,6 +223,7 @@ static void kg_ssr_pass(KGpuSurf *cs, KGpuSurf *zs)
     }
     in[0] = s_post.copy_srv; in[1] = NULL; in[2] = zs->srv; in[3] = NULL;
     in[4] = s_ssr.srv[0]; in[5] = s_ssr.srv[1]; in[6] = s_ssr.srv[2]; in[7] = s_ssr.blur_srv;
+    in[8] = rt ? s_ssr.rt_srv : NULL;
     smp[0] = s_post.smp_lin; smp[1] = s_post.smp_pt;
     ID3D11DeviceContext_OMSetRenderTargets(G.ctx, 1, &cs->rtv, NULL);
     fullscreen_pass_state(cs->hw, cs->hh);
@@ -219,9 +231,9 @@ static void kg_ssr_pass(KGpuSurf *cs, KGpuSurf *zs)
     ID3D11DeviceContext_PSSetShader(G.ctx, s_ssr.ps, NULL, 0);
     ID3D11DeviceContext_PSSetConstantBuffers(G.ctx, 0, 1, &s_post.cb);
     ID3D11DeviceContext_PSSetSamplers(G.ctx, 0, 2, smp);
-    ID3D11DeviceContext_PSSetShaderResources(G.ctx, 0, 8, in);
+    ID3D11DeviceContext_PSSetShaderResources(G.ctx, 0, 9, in);
     ID3D11DeviceContext_Draw(G.ctx, 3, 0);
-    ID3D11DeviceContext_PSSetShaderResources(G.ctx, 0, 8, none);
+    ID3D11DeviceContext_PSSetShaderResources(G.ctx, 0, 9, none);
     if (dumping) {
         char path[MAX_PATH + 32];
         snprintf(path, sizeof(path), "%s_%llu_after.bmp", s_ssr.dump, s_ssr.frames + 1);
@@ -238,6 +250,7 @@ static void kg_ssr_pass(KGpuSurf *cs, KGpuSurf *zs)
 /* A frame whose pass did not run (no HUD point reached on the main target) leaves nothing for the next one. */
 static void kg_ssr_after_flip(void)
 {
+    s_ssr.rt_valid = false;
     if (!s_ssr.used) return;
     s_ssr.used = false;
     ssr_clear();

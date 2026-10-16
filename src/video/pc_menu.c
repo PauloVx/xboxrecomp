@@ -349,7 +349,7 @@ static int photo_row_named(const char *name)
 static int video_row_named(const char *name)
 {
     static const char *const names[] = { "mode", "window", "internal", "aa", "af", "dof", "sharpen", "ao_method", "ao_quality", "reflections",
-        "aspect", "fov", "scale", "filter", "vsync", "fps", "blur" };
+        "ray_tracing", "aspect", "fov", "scale", "filter", "vsync", "fps", "blur" };
     int i;
     for (i = 0; i < (int)(sizeof(names) / sizeof(names[0])); i++) if (!_stricmp(name, names[i])) return i;
     return -1;
@@ -1429,6 +1429,8 @@ static const char *localized_video_literal(const char *text)
         { "AMBIENT OCCLUSION", "OCLUSÃO DE AMBIENTE", "OCLUSIÓN AMBIENTAL", "OCCLUSION AMBIANTE", "UMGEBUNGSVERDECKUNG", "OCCLUSIONE AMBIENTALE" },
         { "AO QUALITY", "QUALIDADE DA OCLUSÃO", "CALIDAD DE OCLUSIÓN", "QUALITÉ DE L’OCCLUSION", "AO-QUALITÄT", "QUALITÀ AO" },
         { "REFLECTIONS", "REFLEXOS", "REFLEJOS", "RÉFLEXIONS", "SPIEGELUNGEN", "RIFLESSI" },
+        { "RAY TRACING (EXPERIMENTAL)", "RAY TRACING (EXPERIMENTAL)", "TRAZADO DE RAYOS (EXPERIMENTAL)", "RAY TRACING (EXPÉRIMENTAL)",
+          "RAYTRACING (EXPERIMENTELL)", "RAY TRACING (SPERIMENTALE)" },
         { "FIELD OF VIEW", "FOV", "CAMPO DE VISIÓN", "CHAMP DE VISION", "SICHTFELD", "CAMPO VISIVO" },
         { "MOTION BLUR", "DESFOQUE DE MOVIMENTO", "DESENFOQUE DE MOVIMIENTO", "FLOU DE MOUVEMENT", "BEWEGUNGSUNSCHÄRFE", "MOSSO DI MOVIMENTO" },
         /* photo mode (Portuguese reviewed; the others machine drafts, like the launcher's) */

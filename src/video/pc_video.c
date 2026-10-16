@@ -30,6 +30,7 @@ static PcVideoSettings s_cur, s_file;    /* what is in force; what the settings 
 static unsigned s_locked;
 static char s_path[512];
 static PcVideoResizeHook s_resize_hook;
+static PcVideoRtSupport s_rt_support;
 
 void pc_video_defaults(PcVideoSettings *s)
 {
@@ -192,6 +193,9 @@ static int apply_key(PcVideoSettings *s, const char *key, const char *value)
     } else if (!_stricmp(key, "reflections")) {
         int a = name_index(k_refl_names, PCV_REFL_COUNT, value);
         if (a >= 0) { s->reflections = (unsigned)a; return 1; }
+    } else if (!_stricmp(key, "ray_tracing")) {
+        if (!_stricmp(value, "on")) { s->ray_tracing = 1; return 1; }
+        if (!_stricmp(value, "off")) { s->ray_tracing = 0; return 1; }
     } else if (!_stricmp(key, "ssao")) {
         /* The original single SSAO setting combined method and quality. */
         int a = name_index(k_ao_quality_names, PCV_AOQ_COUNT, value);
@@ -247,7 +251,8 @@ size_t pc_video_format(const PcVideoSettings *s, char *out, size_t cap)
         "sharpen=%s\n"
         "ao_method=%s\n"
         "ao_quality=%s\n"
-        "reflections=%s\n",
+        "reflections=%s\n"
+        "ray_tracing=%s\n",
         s->internal_height, s->window_width, s->window_height,
         s->borderless ? "borderless" : "windowed",
         s->scale == PCV_SCALE_STRETCH ? "stretch" : s->scale == PCV_SCALE_INTEGER ? "integer" : "fit",
@@ -257,7 +262,7 @@ size_t pc_video_format(const PcVideoSettings *s, char *out, size_t cap)
         k_step_names[s->sharpen < PCV_STEP_COUNT ? s->sharpen : 0],
         k_ao_names[s->ao_method < PCV_AO_COUNT ? s->ao_method : PCV_AO_OFF],
         k_ao_quality_names[s->ao_quality < PCV_AOQ_COUNT ? s->ao_quality : PCV_AOQ_HIGH],
-        k_refl_names[s->reflections < PCV_REFL_COUNT ? s->reflections : PCV_REFL_HIGH]);
+        k_refl_names[s->reflections < PCV_REFL_COUNT ? s->reflections : PCV_REFL_HIGH], s->ray_tracing ? "on" : "off");
     return n < 0 ? 0 : (size_t)n;
 }
 
@@ -367,6 +372,7 @@ static unsigned apply_environment(PcVideoSettings *s)
         int a = name_index(k_refl_names, PCV_REFL_COUNT, t);
         lock |= PCV_LOCK_REFLECTIONS; s->reflections = a >= 0 ? (unsigned)a : PCV_REFL_ORIGINAL;
     }
+    if ((t = env_text("RECOMP_KGPU_RT")) != NULL) { lock |= PCV_LOCK_RAY_TRACING; s->ray_tracing = strcmp(t, "0") != 0; }
     if ((t = env_text("RECOMP_INTERNAL_HEIGHT")) != NULL && parse_uint(t, 1, 100000, &u) &&
         in_list(pc_video_internal_heights, pc_video_internal_height_count, u)) {
         lock |= PCV_LOCK_INTERNAL; s->internal_height = u;
@@ -406,13 +412,14 @@ static void do_init(const char *path_override)
         unsigned rw, rh;
         pc_video_render_size_for(&s_cur, &rw, &rh);
         fprintf(stderr, "[VIDEO] internal %ux%u (%up), window %ux%u %s, scale %u, filter %s, vsync %u, cap %u, camera %s, fov %g, blur %s%s; "
-                        "aa %s, af %ux, dof %s, sharpen %s, ao %s (%s), reflections %s; locked 0x%X\n",
+                        "aa %s, af %ux, dof %s, sharpen %s, ao %s (%s), reflections %s, ray tracing %s; locked 0x%X\n",
                 rw, rh, s_cur.internal_height, s_cur.window_width, s_cur.window_height,
                 s_cur.borderless ? "borderless" : "windowed", s_cur.scale, s_cur.nearest ? "nearest" : "linear",
                 s_cur.vsync, s_cur.fps_limit, pc_video_aspect_name(s_cur.aspect), s_cur.fov,
                 s_cur.motion_blur_off ? "off" : "original", s_cur.render_override_w ? " (raster size overridden)" : "",
                 k_aa_names[s_cur.aa], s_cur.af, k_step_names[s_cur.dof], k_step_names[s_cur.sharpen],
-                k_ao_names[s_cur.ao_method], k_ao_quality_names[s_cur.ao_quality], k_refl_names[s_cur.reflections], s_locked);
+                k_ao_names[s_cur.ao_method], k_ao_quality_names[s_cur.ao_quality], k_refl_names[s_cur.reflections],
+                s_cur.ray_tracing ? "on" : "off", s_locked);
     }
 }
 
@@ -427,7 +434,7 @@ void pc_video_init(void) { InitOnceExecuteOnce(&s_once, init_cb, NULL, NULL); }
 void pc_video_test_reset(const char *path)
 {
     INIT_ONCE fresh = INIT_ONCE_STATIC_INIT;
-    s_once = fresh; s_resize_hook = NULL; s_generation = 0;
+    s_once = fresh; s_resize_hook = NULL; s_rt_support = NULL; s_generation = 0;
     InitOnceExecuteOnce(&s_once, init_cb, (PVOID)path, NULL);
 }
 #define READ_LOCK() AcquireSRWLockShared(&s_lock)
@@ -436,7 +443,7 @@ void pc_video_test_reset(const char *path)
 #define WRITE_UNLOCK() ReleaseSRWLockExclusive(&s_lock)
 #else
 void pc_video_init(void) { if (!s_once_done) { s_once_done = 1; do_init(NULL); } }
-void pc_video_test_reset(const char *path) { s_once_done = 1; s_resize_hook = NULL; s_generation = 0; do_init(path); }
+void pc_video_test_reset(const char *path) { s_once_done = 1; s_resize_hook = NULL; s_rt_support = NULL; s_generation = 0; do_init(path); }
 #define READ_LOCK() ((void)0)
 #define READ_UNLOCK() ((void)0)
 #define WRITE_LOCK() ((void)0)
@@ -499,7 +506,7 @@ static int valid_settings(const PcVideoSettings *s)
            s->scale <= PCV_SCALE_INTEGER && in_list(pc_video_fps_limits, pc_video_fps_limit_count, s->fps_limit) &&
            s->aspect < PCV_ASPECT_COUNT && valid_fov(s->fov) && s->aa < PCV_AA_COUNT &&
            in_list(pc_video_af_levels, pc_video_af_level_count, s->af) && s->dof < PCV_STEP_COUNT && s->sharpen < PCV_STEP_COUNT &&
-           s->ao_method < PCV_AO_COUNT && s->ao_quality < PCV_AOQ_COUNT && s->reflections < PCV_REFL_COUNT;
+           s->ao_method < PCV_AO_COUNT && s->ao_quality < PCV_AOQ_COUNT && s->reflections < PCV_REFL_COUNT && s->ray_tracing <= 1;
 }
 
 /* The new values over the current ones, except where the environment holds a field. */
@@ -524,6 +531,7 @@ static PcVideoSettings merge_unlocked(const PcVideoSettings *base, const PcVideo
     if (locked & PCV_LOCK_AO_METHOD) r.ao_method = base->ao_method;
     if (locked & PCV_LOCK_AO_QUALITY) r.ao_quality = base->ao_quality;
     if (locked & PCV_LOCK_REFLECTIONS) r.reflections = base->reflections;
+    if (locked & PCV_LOCK_RAY_TRACING) r.ray_tracing = base->ray_tracing;
     return r;
 }
 
@@ -614,4 +622,22 @@ int pc_video_live_resize(void)
     live = s_resize_hook != NULL;
     READ_UNLOCK();
     return live;
+}
+
+void pc_video_set_rt_support(PcVideoRtSupport query)
+{
+    pc_video_init();
+    WRITE_LOCK();
+    s_rt_support = query;
+    WRITE_UNLOCK();
+}
+
+int pc_video_rt_support(void)
+{
+    PcVideoRtSupport query;
+    pc_video_init();
+    READ_LOCK();
+    query = s_rt_support;
+    READ_UNLOCK();
+    return query ? query() : PCV_RT_UNAVAILABLE;
 }

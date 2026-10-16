@@ -453,7 +453,8 @@ int pc_photo_camera(float m[4][3], float half_y)
     keys = InterlockedCompareExchange(&s_keys, 0, 0);
     mdx = InterlockedExchange(&s_mouse_dx, 0);
     mdy = InterlockedExchange(&s_mouse_dy, 0);
-    s_yaw += s_hand * (mdx * PCP_MOUSE_DEG * PCP_DEG + axis(s_pad[2]) * PCP_STICK_DEG * PCP_DEG * dt);
+    /* the screen's right is the camera matrix's left (r below): turning and moving sideways go the other way */
+    s_yaw -= s_hand * (mdx * PCP_MOUSE_DEG * PCP_DEG + axis(s_pad[2]) * PCP_STICK_DEG * PCP_DEG * dt);
     s_pitch += -mdy * PCP_MOUSE_DEG * PCP_DEG + axis(s_pad[3]) * PCP_STICK_DEG * PCP_DEG * dt;
     s_pitch = clampd(s_pitch, -89.0 * PCP_DEG, 89.0 * PCP_DEG);
     s_yaw = fmod(s_yaw, 2.0 * PCP_PI);
@@ -475,7 +476,7 @@ int pc_photo_camera(float m[4][3], float half_y)
         const double vert = ((keys & K_E) ? 1 : 0) - ((keys & K_Q) ? 1 : 0) + (s_pad[5] - s_pad[4]) / 255.0;
         double flat[3] = { r[0], 0, r[2] };
         if (!norm3(flat)) { flat[0] = r[0]; flat[2] = r[2]; }
-        for (k = 0; k < 3; k++) move[k] = f[k] * fwd + flat[k] * side;
+        for (k = 0; k < 3; k++) move[k] = f[k] * fwd - flat[k] * side;
         move[1] += vert;
     }
     speed = k_speeds[s_speed] * ((keys & K_FAST) ? 3.0 : 1.0) * ((keys & K_SLOW) ? 0.25 : 1.0);

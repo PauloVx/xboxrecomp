@@ -19,6 +19,7 @@ enum {
     R_MODE = PCV_ROW_MODE, R_WINDOW = PCV_ROW_WINDOW, R_INTERNAL = PCV_ROW_INTERNAL, R_AA = PCV_ROW_AA, R_AF = PCV_ROW_AF,
     R_DOF = PCV_ROW_DOF, R_SHARPEN = PCV_ROW_SHARPEN, R_ASPECT = PCV_ROW_ASPECT, R_FOV = PCV_ROW_FOV, R_SCALE = PCV_ROW_SCALE,
     R_AO_METHOD = PCV_ROW_AO_METHOD, R_AO_QUALITY = PCV_ROW_AO_QUALITY, R_REFLECTIONS = PCV_ROW_REFLECTIONS,
+    R_RAY_TRACING = PCV_ROW_RAY_TRACING,
     R_FILTER = PCV_ROW_FILTER, R_VSYNC = PCV_ROW_VSYNC, R_FPS = PCV_ROW_FPS, R_BLUR = PCV_ROW_BLUR, R_RESET = PCV_ROW_RESET,
     R_DONE = PCV_ROW_DONE, R_COUNT = PCV_ROW_COUNT
 };
@@ -115,16 +116,19 @@ static unsigned wrap(int v, unsigned n) { return (unsigned)(((v % (int)n) + (int
 
 static unsigned row_lock_bit(int row);
 
+/* Ray tracing without a GPU that can do it cannot be changed either. */
+static int rt_unavailable(int row) { return row == R_RAY_TRACING && pc_video_rt_support() == PCV_RT_UNAVAILABLE; }
+
 int pc_video_menu_row_locked(int row)
 {
-    return (pc_video_locked() & row_lock_bit(row)) != 0;
+    return (pc_video_locked() & row_lock_bit(row)) != 0 || rt_unavailable(row);
 }
 
 int pc_video_menu_row_change(int row, int dir)
 {
     PcVideoSettings s;
     unsigned locked = pc_video_locked(), i;
-    if (!dir || row < 0 || row >= R_RESET || (locked & row_lock_bit(row))) return 0;
+    if (!dir || row < 0 || row >= R_RESET || (locked & row_lock_bit(row)) || rt_unavailable(row)) return 0;
     dir = dir < 0 ? -1 : 1;
     pc_video_get(&s);
     switch (row) {
@@ -159,6 +163,8 @@ int pc_video_menu_row_change(int row, int dir)
         s.ao_quality = wrap((int)s.ao_quality + dir, PCV_AOQ_COUNT); break;
     case R_REFLECTIONS:
         s.reflections = wrap((int)s.reflections + dir, PCV_REFL_COUNT); break;
+    case R_RAY_TRACING:
+        s.ray_tracing = !s.ray_tracing; break;
     case R_ASPECT:
         s.aspect = wrap((int)s.aspect + dir, PCV_ASPECT_COUNT); break;
     case R_FOV: {
@@ -499,13 +505,13 @@ static int text_width(HFONT font, const wchar_t *text)
 
 static const char *const k_row_label[R_COUNT] = {
     "WINDOW MODE", "WINDOW SIZE", "INTERNAL RESOLUTION", "ANTI-ALIASING", "ANISOTROPIC FILTERING", "DEPTH OF FIELD",
-    "SHARPENING", "AO METHOD", "AO QUALITY", "REFLECTIONS", "ASPECT RATIO", "FIELD OF VIEW", "SCALING", "SCALING FILTER", "VSYNC", "FRAME RATE LIMIT",
+    "SHARPENING", "AO METHOD", "AO QUALITY", "REFLECTIONS", "RAY TRACING (EXPERIMENTAL)", "ASPECT RATIO", "FIELD OF VIEW", "SCALING", "SCALING FILTER", "VSYNC", "FRAME RATE LIMIT",
     "MOTION BLUR", "RESET TO DEFAULTS", "DONE"
 };
 
 static const char *const k_row_label_pt[R_COUNT] = {
     "MODO DE JANELA", "RESOLUÇÃO", "RESOLUÇÃO INTERNA", "SUAVIZAÇÃO DE SERRILHADO", "FILTRAGEM ANISOTRÓPICA", "PROFUNDIDADE DE CAMPO",
-    "NITIDEZ", "MÉTODO DE OCLUSÃO", "QUALIDADE DA OCLUSÃO", "REFLEXOS", "PROPORÇÃO", "FOV", "ESCALA DA IMAGEM", "FILTRO DE ESCALA", "SINCRONIZAÇÃO VERTICAL", "LIMITE DE QUADROS",
+    "NITIDEZ", "MÉTODO DE OCLUSÃO", "QUALIDADE DA OCLUSÃO", "REFLEXOS", "RAY TRACING (EXPERIMENTAL)", "PROPORÇÃO", "FOV", "ESCALA DA IMAGEM", "FILTRO DE ESCALA", "SINCRONIZAÇÃO VERTICAL", "LIMITE DE QUADROS",
     "DESFOQUE DE MOVIMENTO", "RESTAURAR PADRÕES", "CONCLUÍDO"
 };
 
@@ -524,7 +530,7 @@ static const char *localized_video_value(const char *value)
         { "SSAO CLASSIC", "SSAO CLÁSSICO" }, { "ORIGINAL", "ORIGINAL" },
         { "STRETCH", "ESTICAR" }, { "INTEGER", "INTEIRA" }, { "FIT", "AJUSTAR" },
         { "NEAREST", "VIZINHO PRÓXIMO" }, { "LINEAR", "LINEAR" }, { "UNLIMITED", "ILIMITADO" },
-        { "32:9", "SUPER ULTRA-WIDE (32:9)" }
+        { "32:9", "SUPER ULTRA-WIDE (32:9)" }, { "UNAVAILABLE", "INDISPONÍVEL" }
     };
     int i;
     for (i = 0; i < (int)(sizeof(words) / sizeof(words[0])); ++i)
@@ -586,6 +592,9 @@ size_t pc_video_menu_row_value(int row, char *out, size_t cap)
         strcpy(value, s->reflections == PCV_REFL_ORIGINAL ? "ORIGINAL" : s->reflections == PCV_REFL_LOW ? "LOW" :
                 s->reflections == PCV_REFL_MEDIUM ? "MEDIUM" : s->reflections == PCV_REFL_ULTRA ? "ULTRA" : "HIGH");
         break;
+    case R_RAY_TRACING:
+        strcpy(value, pc_video_rt_support() == PCV_RT_UNAVAILABLE ? "UNAVAILABLE" : s->ray_tracing ? "ON" : "OFF");
+        break;
     case R_ASPECT:
         strcpy(value, s->aspect == PCV_ASPECT_ORIGINAL ? "ORIGINAL" : s->aspect == PCV_ASPECT_4_3 ? "4:3" :
                 s->aspect == PCV_ASPECT_16_9 ? "16:9" : s->aspect == PCV_ASPECT_21_9 ? "21:9" : "32:9");
@@ -620,6 +629,9 @@ const char *pc_video_menu_row_help(int row)
 {
     PcVideoSettings cur;
     int live = pc_video_live_resize();
+    if (rt_unavailable(row) && !(pc_video_locked() & PCV_LOCK_RAY_TRACING))
+        return video_menu_text("Ray tracing needs the GPU renderer and a graphics card with DirectX Raytracing.",
+                               "O ray tracing exige o renderizador GPU e uma placa de vídeo com DirectX Raytracing.");
     if (pc_video_menu_row_locked(row)) return video_menu_text("This setting is fixed by an environment variable for this run.", "Esta opção está fixada por uma variável de ambiente nesta partida.");
     pc_video_get(&cur);
     switch (row) {
@@ -645,6 +657,12 @@ const char *pc_video_menu_row_help(int row)
         if (!live) return video_menu_text("Screen-space reflections are available with the GPU renderer only.", "Os reflexos em espaço de tela só estão disponíveis no renderizador GPU.");
         return video_menu_text("Replaces the game's low-resolution reflection maps with reflections of the scene on screen. Original keeps the maps. Higher quality traces more steps.",
                                "Substitui os mapas de reflexo de baixa resolução do jogo por reflexos da cena na tela. Original mantém os mapas. Qualidades maiores traçam mais passos.");
+    case R_RAY_TRACING:
+        if (pc_video_rt_support() == PCV_RT_RESTART)
+            return video_menu_text("Experimental. The GPU's ray tracing cores add shadows from characters and props, ambient occlusion, bounce light, and reflections when Reflections is above Original. Takes effect when the game restarts.",
+                                   "Experimental. Os núcleos de ray tracing da GPU adicionam sombras de personagens e objetos, oclusão de ambiente, luz rebatida e reflexos quando Reflexos está acima de Original. Vale a partir da próxima vez que o jogo iniciar.");
+        return video_menu_text("Experimental. The GPU's ray tracing cores add shadows from characters and props, ambient occlusion, bounce light, and reflections when Reflections is above Original.",
+                               "Experimental. Os núcleos de ray tracing da GPU adicionam sombras de personagens e objetos, oclusão de ambiente, luz rebatida e reflexos quando Reflexos está acima de Original.");
     case R_ASPECT: return video_menu_text("The shape of the camera. Original is the game's 4:3 camera.", "Proporção da câmera. Original usa a proporção 4:3 do jogo.");
     case R_FOV: return video_menu_text("Vertical field of view during gameplay, in degrees.", "Campo de visão vertical durante o jogo, em graus.");
     case R_SCALE: return video_menu_text("Fit keeps the picture's shape. Stretch fills the window. Integer uses whole-number scales.", "Ajustar mantém a proporção da imagem. Esticar preenche a janela. Inteira usa múltiplos sem fração.");
@@ -689,7 +707,7 @@ static unsigned row_lock_bit(int row)
     case R_MODE: return PCV_LOCK_WINDOW_MODE; case R_WINDOW: return PCV_LOCK_WINDOW_SIZE; case R_INTERNAL: return PCV_LOCK_INTERNAL;
     case R_AA: return PCV_LOCK_AA; case R_AF: return PCV_LOCK_AF; case R_DOF: return PCV_LOCK_DOF; case R_SHARPEN: return PCV_LOCK_SHARPEN;
     case R_AO_METHOD: return PCV_LOCK_AO_METHOD; case R_AO_QUALITY: return PCV_LOCK_AO_QUALITY;
-    case R_REFLECTIONS: return PCV_LOCK_REFLECTIONS;
+    case R_REFLECTIONS: return PCV_LOCK_REFLECTIONS; case R_RAY_TRACING: return PCV_LOCK_RAY_TRACING;
     case R_ASPECT: return PCV_LOCK_ASPECT; case R_FOV: return PCV_LOCK_FOV; case R_SCALE: return PCV_LOCK_SCALE;
     case R_FILTER: return PCV_LOCK_FILTER; case R_VSYNC: return PCV_LOCK_VSYNC; case R_FPS: return PCV_LOCK_FPS;
     case R_BLUR: return PCV_LOCK_BLUR; default: return 0;
