@@ -1,7 +1,7 @@
 // The reflections' one ray a pixel (krt_reflect.hlsl), made smooth: each pixel averages the reflective pixels of its
 // kind around it whose colour is close (a slightly rough surface, edges kept). The weapon is rough, flat-faceted metal
 // that bobs against the camera: it averages over a much wider neighbourhood, and a little over frames.
-// Output for the screen-space pass: rgb the colour, a = 2 traced, 0 not.
+// Output for the screen-space pass: rgb the colour, a = 2 traced on the scene, 3 on the weapon, 0 not.
 #include "krt_common.hlsli"
 
 RWTexture2D<float4> output : register(u0);
@@ -40,5 +40,5 @@ void main(uint3 id : SV_DispatchThreadID)
     } else {
         history[id.xy] = 0.0;
     }
-    output[id.xy] = float4(c, 2.0);
+    output[id.xy] = float4(c, me.a);
 }

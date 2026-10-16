@@ -65,7 +65,8 @@ typedef struct KrtFrameCb {
     float fx[4];                        /* occlusion strength, its reach, bounce colour strength */
 } KrtFrameCb;
 
-/* The brightness factors shade learns (krt_calibrate.hlsl): one a texture index, then one a kind of lighting. */
+/* The colour factors shade learns (krt_calibrate.hlsl), rgb in 16 bytes from sums of 32: one a texture index, then
+ * one a kind of lighting. */
 #define KRT_FACTOR_KEYS (KRT_TEX_MAX + 3u)
 
 static struct {
@@ -523,11 +524,11 @@ static bool make_pipelines(void)
         FAILED(ID3D12Resource_Map(K.consts, 0, NULL, (void **)&K.consts_cpu)) ||
         FAILED(ID3D12Resource_Map(K.instance, 0, NULL, (void **)&K.instance_cpu)))
         return false;
-    K.sums = make_buffer((UINT64)KRT_FACTOR_KEYS * 8, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    K.factors = make_buffer((UINT64)KRT_FACTOR_KEYS * 4, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    K.sums = make_buffer((UINT64)KRT_FACTOR_KEYS * 32, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    K.factors = make_buffer((UINT64)KRT_FACTOR_KEYS * 16, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     if (!K.sums || !K.factors) return false;
-    raw_uav(H_TRACE_UAV + 1, K.sums, (UINT64)KRT_FACTOR_KEYS * 8);
-    raw_uav(H_TRACE_UAV + 2, K.factors, (UINT64)KRT_FACTOR_KEYS * 4);
+    raw_uav(H_TRACE_UAV + 1, K.sums, (UINT64)KRT_FACTOR_KEYS * 32);
+    raw_uav(H_TRACE_UAV + 2, K.factors, (UINT64)KRT_FACTOR_KEYS * 16);
     K.geoms = (D3D12_RAYTRACING_GEOMETRY_DESC *)calloc(KRT_DRAWS_MAX, sizeof(*K.geoms));
     return K.geoms != NULL;
 #else

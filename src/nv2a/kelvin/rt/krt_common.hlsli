@@ -22,7 +22,7 @@ cbuffer Frame : register(b0)
     float4 fx;                  // occlusion strength, its reach, bounce colour strength
 };
 
-// Brightness factors for shade (krt_calibrate.hlsl): one a texture index, then one a kind of lighting.
+// Colour factors for shade (krt_calibrate.hlsl), rgb in 16 bytes: one a texture index, then one a kind of lighting.
 RWByteAddressBuffer factors : register(u2);
 static const uint KRT_FACTOR_KIND = 4096u, KRT_FACTOR_KEYS = 4096u + 3u;
 
@@ -124,21 +124,21 @@ float3 shade_raw(uint geometry, uint primitive, float2 bary, float t, out uint k
     float3 albedo = (info.w & KRT_TEX0) ? sample_stage(info, 0, uvs.xy, lod).rgb : 1.0;
     float3 light = 1.0;
     kind = 2u;
-    if (info.w & KRT_TEX1) { light = sample_stage(info, 1, uvs.zw, lod).rgb; kind = 0u; }
+    if (info.w & KRT_TEX1) { light = dot(sample_stage(info, 1, uvs.zw, lod).rgb, float3(0.299, 0.587, 0.114)); kind = 0u; }
     else if (dot(colour.rgb, 1.0) > 0.003) { light = colour.rgb; kind = 1u; }
     return albedo * light;
 }
 
-// The colour of a hit as the game draws it: shade_raw, at the brightness the picture shows that texture -- or that
-// kind of lighting, until the texture has been seen on screen.
+// The colour of a hit as the game draws it: shade_raw, in the colour and brightness the picture shows that texture --
+// or that kind of lighting, until the texture has been seen on screen.
 float3 shade(uint geometry, uint primitive, float2 bary, float t)
 {
     uint kind;
     float3 c = shade_raw(geometry, primitive, bary, t, kind);
     uint4 info = draw_info[geometry];
-    float f = (info.w & KRT_TEX0) ? asfloat(factors.Load(info.y * 4)) : 0.0;
-    if (!(f > 0.0)) f = asfloat(factors.Load((KRT_FACTOR_KIND + kind) * 4));
-    return c * (f > 0.0 ? f : 2.0);
+    float3 f = (info.w & KRT_TEX0) ? asfloat(factors.Load3(info.y * 16)) : 0.0;
+    if (!(f.g > 0.0)) f = asfloat(factors.Load3((KRT_FACTOR_KIND + kind) * 16));
+    return c * (f.g > 0.0 ? f : 2.0);
 }
 // Whether a cut-out (alpha-tested) triangle is there at that point, by the draw's own test.
 bool alpha_passes(uint geometry, uint primitive, float2 bary)
