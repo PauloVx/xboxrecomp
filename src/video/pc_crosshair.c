@@ -83,6 +83,18 @@ void pc_crosshair_hit(int kind)
     ReleaseSRWLockExclusive(&s_lock);
 }
 
+int pc_crosshair_replaces_dot(void)
+{
+    PcVideoSettings v;
+    int replaces;
+    pc_video_get(&v);
+    if (v.crosshair == PCX_ORIGINAL) return 0;
+    AcquireSRWLockShared(&s_lock);
+    replaces = s_control && now_seconds() - s_last_tick < CONTROL_TIMEOUT && s_zoom >= 0.9f;
+    ReleaseSRWLockShared(&s_lock);
+    return replaces;
+}
+
 double pc_crosshair_since_shot(void)
 {
     double since;
@@ -140,6 +152,7 @@ int pc_crosshair_frame(PcCrosshairDraw *out)
 void pc_crosshair_tick(int in_control, float speed, unsigned shots, float zoom) { (void)in_control; (void)speed; (void)shots; (void)zoom; }
 void pc_crosshair_hit(int kind) { (void)kind; }
 double pc_crosshair_since_shot(void) { return 1e9; }
+int pc_crosshair_replaces_dot(void) { return 0; }
 int pc_crosshair_frame(PcCrosshairDraw *out) { memset(out, 0, sizeof(*out)); return 0; }
 void pc_crosshair_test_clock(double (*now)(void)) { (void)now; }
 #endif

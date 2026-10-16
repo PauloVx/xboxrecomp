@@ -344,6 +344,30 @@ static void kg_dl_draw(const KGpuDraw *d)
     }
 }
 
+/* The game's aiming dot: a few HUD quads within a few pixels of the centre of its 640 x 480 screen (the HUD's vertex
+ * positions are screen positions, attribute 0, read here from the draw's own arrays). */
+static bool kg_hud_is_reticle(const KGpuDraw *d)
+{
+    const KGpuAttrSrc *as;
+    float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+    uint32_t i;
+    if (!d->gvs || !d->indices || !d->icount || d->icount > 24) return false;
+    as = &d->gvs->attr[0];
+    if (as->fmt != 4 || as->count < 2 || !as->data || !as->stride) return false;
+    for (i = 0; i < d->icount; i++) {
+        const int64_t at = (int64_t)d->indices[i] * as->stride;
+        const float *p;
+        if (d->indices[i] == 0xFFFFFFFFu) continue;
+        if (at < as->lo || at + 8 > as->hi + 1) return false;
+        p = (const float *)(as->data + at);
+        if (p[0] < x0) x0 = p[0];
+        if (p[0] > x1) x1 = p[0];
+        if (p[1] < y0) y0 = p[1];
+        if (p[1] > y1) y1 = p[1];
+    }
+    return x1 > x0 && y1 > y0 && x0 >= 306.0f && x1 <= 334.0f && y0 >= 226.0f && y1 <= 254.0f;
+}
+
 static void kgpu_draw_now(const KGpuDraw *d)
 {
     const KelvinTarget *t = d->t;
@@ -447,6 +471,8 @@ again:
     kg_rtc_note_draw(ps, dc->cs, dc->zs);
     kg_post_note_draw(ps, dc->cs, dc->zs);       /* the picture effects run when the HUD begins (kelvin_gpu_post.inc) */
     if (kg_dlss_take_refresh()) { dc->valid = false; goto again; }   /* the target changed size under this draw */
+    /* a crosshair of the PC's replaces the game's aiming dot (pc_crosshair.c) */
+    if (s_post.done && post_main_target(dc->cs) && kg_hud_is_reticle(d) && pc_crosshair_replaces_dot()) return;
     if (dc->zs) {
         if (ps->depth_write || ps->stencil_write) dc->zs->real = true;
         depth_surface_refresh(dc->zs);

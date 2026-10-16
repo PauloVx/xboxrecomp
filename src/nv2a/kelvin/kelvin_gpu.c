@@ -24,6 +24,7 @@
 #include "kelvin_int.h"
 #include "../../video/fb_present.h"
 #include "../../video/pc_video.h"
+#include "../../video/pc_crosshair.h"
 
 #include "kelvin_gpu_hlsl.inc"
 
