@@ -18,6 +18,7 @@ add_library(xbox_nv2a STATIC
     kelvin/kelvin_render.c
     kelvin/kelvin_gpu.c
     kelvin/kelvin_rt.c
+    kelvin/kelvin_dlss.c
     kelvin/kelvin_vsh.c
     kelvin/kelvin_pixel.c
     kelvin/kelvin_texture.c
@@ -62,6 +63,18 @@ if(WIN32)
     else()
         message(STATUS "dxc not found: the renderer is built without ray tracing")
     endif()
+endif()
+
+# NVIDIA DLSS (kelvin_dlss.c): the SDK's headers and import library, when they are in third_party/dlss (scripts fetch
+# them; they are not part of the repositories). Without them DLAA falls back to FXAA.
+set(KDLSS_SDK "${CMAKE_CURRENT_SOURCE_DIR}/../../../dlss" CACHE PATH "NVIDIA DLSS SDK (include/, lib/Windows_x86_64/x64)")
+if(WIN32 AND EXISTS "${KDLSS_SDK}/include/nvsdk_ngx.h" AND EXISTS "${KDLSS_SDK}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib")
+    target_include_directories(xbox_nv2a PRIVATE "${KDLSS_SDK}/include")
+    target_compile_definitions(xbox_nv2a PRIVATE KDLSS_HAVE_SDK=1)
+    target_link_libraries(xbox_nv2a PRIVATE "${KDLSS_SDK}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib")
+    message(STATUS "DLSS SDK: ${KDLSS_SDK}")
+else()
+    message(STATUS "DLSS SDK not found at ${KDLSS_SDK}: DLAA falls back to FXAA")
 endif()
 
 target_include_directories(xbox_nv2a PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

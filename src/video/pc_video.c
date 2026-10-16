@@ -71,7 +71,8 @@ static int aspect_from_name(const char *t)
     return -1;
 }
 
-static const char *const k_aa_names[PCV_AA_COUNT] = { "off", "fxaa", "ssaa" };
+static const char *const k_aa_names[PCV_AA_COUNT] = { "off", "fxaa", "ssaa", "dlaa", "dlss_quality", "dlss_balanced",
+                                                      "dlss_performance" };
 static const char *const k_step_names[PCV_STEP_COUNT] = { "off", "low", "medium", "high" };
 static const char *const k_ao_names[PCV_AO_COUNT] = { "off", "ssao", "hbao", "hbao_plus", "gtao" };
 static const char *const k_ao_quality_names[PCV_AOQ_COUNT] = { "low", "medium", "high", "ultra" };
@@ -119,6 +120,12 @@ void pc_video_raster_size_for(const PcVideoSettings *s, unsigned *w, unsigned *h
 {
     const unsigned f = pc_video_ssaa_factor_for(s);
     pc_video_render_size_for(s, w, h);
+    if (s->aa >= PCV_AA_DLSS_QUALITY && s->aa <= PCV_AA_DLSS_PERFORMANCE && !(s->render_override_w && s->render_override_h)) {
+        double k = s->aa == PCV_AA_DLSS_QUALITY ? 2.0 / 3.0 : s->aa == PCV_AA_DLSS_BALANCED ? 0.58 : 0.5;
+        if (k * *w < 640.0) k = 640.0 / *w;
+        if (k * *h < 480.0) k = 480.0 / *h;
+        if (k < 1.0) { *w = ((unsigned)(*w * k + 0.5) + 1u) & ~1u; *h = ((unsigned)(*h * k + 0.5) + 1u) & ~1u; }
+    }
     *w *= f; *h *= f;
 }
 

@@ -33,8 +33,12 @@ extern "C" {
 enum { PCV_ASPECT_ORIGINAL, PCV_ASPECT_4_3, PCV_ASPECT_16_9, PCV_ASPECT_21_9, PCV_ASPECT_32_9, PCV_ASPECT_COUNT };
 enum { PCV_SCALE_FIT, PCV_SCALE_STRETCH, PCV_SCALE_INTEGER };
 /* Anti-aliasing: FXAA filters the finished scene (before the HUD); SSAA renders at twice the width and height and
- * resolves back to the internal resolution. Depth of field and sharpening have four steps: off, low, medium, high. */
-enum { PCV_AA_OFF, PCV_AA_FXAA, PCV_AA_SSAA, PCV_AA_COUNT };
+ * resolves back to the internal resolution. DLAA is NVIDIA DLSS at the internal resolution (FXAA where it cannot run);
+ * the DLSS modes rasterise the world smaller (2/3, 0.58 or half the width and height, never under 640 x 480) and DLSS
+ * brings it up to the internal resolution before the HUD.
+ * Depth of field and sharpening have four steps: off, low, medium, high. */
+enum { PCV_AA_OFF, PCV_AA_FXAA, PCV_AA_SSAA, PCV_AA_DLAA, PCV_AA_DLSS_QUALITY, PCV_AA_DLSS_BALANCED, PCV_AA_DLSS_PERFORMANCE,
+       PCV_AA_COUNT };
 enum { PCV_STEP_OFF, PCV_STEP_LOW, PCV_STEP_MEDIUM, PCV_STEP_HIGH, PCV_STEP_COUNT };
 /* Ambient occlusion is a scene-depth effect applied before the HUD. Quality controls sampling
  * density and radius; the AO mask and its depth-aware blur stay at the scene resolution. */

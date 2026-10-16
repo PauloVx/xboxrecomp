@@ -62,6 +62,9 @@ typedef struct KgDc {
 static bool kg_rtc_begin(const KGpuDraw *d, const KgDc *dc, KGpuVs *ve, float zmax);
 static void kg_rtc_end(void);
 static void kg_rtc_note_draw(const KPixelState *ps, const KGpuSurf *cs, KGpuSurf *zs);
+static void kg_dlss_vertex(const KGpuDraw *d, const KgDc *dc, float jit[4]);   /* kelvin_gpu_dlss.inc */
+static const KGpuSurf *kg_dlss_swapped_surface(void);
+static bool kg_dlss_take_refresh(void);
 
 static KgBound s_bd;
 static KgDc s_dc;
@@ -381,6 +384,7 @@ static void kgpu_draw_now(const KGpuDraw *d)
         s_bd.sc.left = -1;
     }
 
+again:
     new_t = !dc->valid || !(d->clean & KG_CLEAN_T);
     new_ps = !dc->valid || !(d->clean & KG_CLEAN_PS);
     cull_changed = dc->cull_enable != (int)d->cull_enable || dc->cull_ctrl != d->cull_ctrl || dc->ccw_front != (int)d->ccw_front ||
@@ -399,7 +403,11 @@ static void kgpu_draw_now(const KGpuDraw *d)
         dc->cs = cs; dc->zs = zs;
         if (!cs && !zs) dc->reject = 1;
         else if (d->cull_enable && d->cull_ctrl == NV_PGRAPH_SETUPRASTER_CULLCTRL_FRONT_AND_BACK) dc->reject = 2;
-        else if (cs && zs && (cs->hw != zs->hw || cs->hh != zs->hh)) dc->reject = 1;
+        else if (cs && zs && (cs->hw != zs->hw || cs->hh != zs->hh)) {
+            /* the main target brought up to the internal resolution by DLSS: the HUD over it needs no depth */
+            if (cs == kg_dlss_swapped_surface()) dc->zs = zs = NULL;
+            else dc->reject = 1;
+        }
         if (!dc->reject) {
             dc->sx = cs ? (double)cs->hw / (double)cs->gw : (double)zs->hw / (double)zs->gw;
             dc->sy = cs ? (double)cs->hh / (double)cs->gh : (double)zs->hh / (double)zs->gh;
@@ -438,6 +446,7 @@ static void kgpu_draw_now(const KGpuDraw *d)
     }
     kg_rtc_note_draw(ps, dc->cs, dc->zs);
     kg_post_note_draw(ps, dc->cs, dc->zs);       /* the picture effects run when the HUD begins (kelvin_gpu_post.inc) */
+    if (kg_dlss_take_refresh()) { dc->valid = false; goto again; }   /* the target changed size under this draw */
     if (dc->zs) {
         if (ps->depth_write || ps->stencil_write) dc->zs->real = true;
         depth_surface_refresh(dc->zs);
@@ -584,6 +593,7 @@ static void kgpu_draw_now(const KGpuDraw *d)
         gc.flags[2] = gv->specular_enable ? 1u : 0u;
         gc.flags[3] = gv->ignore_specular_alpha ? 1u : 0u;
         gc.vm[0] = kg_viewmodel_scale(gv->hash);
+        kg_dlss_vertex(d, dc, gc.jit);
         {
             static VSG last_gc;
             static bool have_gc;
@@ -664,7 +674,8 @@ static void kgpu_draw_now(const KGpuDraw *d)
     {
         KgBound *b = &s_bd;
         ID3D11RenderTargetView *rtv = dc->cs ? dc->cs->rtv : NULL;
-        ID3D11DepthStencilView *dsv = dc->zs ? dc->zs->dsv : NULL;
+        /* after DLSS (kelvin_gpu_dlss.inc) the HUD draws over a target larger than the depth buffer, which it does not use */
+        ID3D11DepthStencilView *dsv = dc->zs && (!dc->cs || dc->zs->hw == dc->cs->hw) ? dc->zs->dsv : NULL;
         ID3D11PixelShader *psx = dc->psx ? dc->psx : (ps->smooth || !G.ps_flat) ? G.ps : G.ps_flat;
         ID3D11BlendState *bs = dc->bs, *ssr_bs = NULL;
         ID3D11PixelShader *ssr_ps = NULL;

@@ -24,6 +24,7 @@ static const char kgpu_vsh_head[] =
 "    float4 g_fog;\n"         /* x fog param 0, y fog param 1 */
 "    uint4  g_flags;\n"       /* x fog enable, y fog mode, z specular enable, w ignore specular alpha */
 "    float4 g_vm;\n"          /* x viewmodel scale about the viewport centre c[-37] */
+"    float4 g_jit;\n"         /* xy DLAA sub-pixel offset, clip units per unit w */
 "};\n"
 "cbuffer VCB : register(b2) { float4 C[192]; };\n"
 "cbuffer ACB : register(b3) { uint4 adesc[16]; float4 inl[16]; };\n"
@@ -341,6 +342,7 @@ static char *vsh_generate(const Nv2aVshProgram *prog)
         "    if (abs(w) < 1.0e-12) w *= g_scale.w;\n"
         "    float2 ndc = float2(pp.x * g_scale.x - 1.0, 1.0 - pp.y * g_scale.y);\n"
         "    o.pos = float4(ndc * w, pp.z * g_scale.z * w, w);\n"
+        "    o.pos.xy += g_jit.xy * w;\n"
         "    o.d0 = c0;\n"
         "    o.d1 = c1;\n"
         "    o.misc = float4(fogv, 0.0, 0.0, 0.0);\n"

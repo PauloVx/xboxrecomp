@@ -537,7 +537,8 @@ static const char *localized_video_value(const char *value)
         { "STRETCH", "ESTICAR" }, { "INTEGER", "INTEIRA" }, { "FIT", "AJUSTAR" },
         { "NEAREST", "VIZINHO PRÓXIMO" }, { "LINEAR", "LINEAR" }, { "UNLIMITED", "ILIMITADO" },
         { "32:9", "SUPER ULTRA-WIDE (32:9)" }, { "UNAVAILABLE", "INDISPONÍVEL" },
-        { "CROSS", "CRUZ" }, { "T-SHAPE", "EM T" }, { "CIRCLE", "CÍRCULO" }
+        { "CROSS", "CRUZ" }, { "T-SHAPE", "EM T" }, { "CIRCLE", "CÍRCULO" },
+        { "DLSS QUALITY", "DLSS QUALIDADE" }, { "DLSS BALANCED", "DLSS EQUILIBRADO" }, { "DLSS PERFORMANCE", "DLSS DESEMPENHO" }
     };
     int i;
     for (i = 0; i < (int)(sizeof(words) / sizeof(words[0])); ++i)
@@ -576,7 +577,9 @@ size_t pc_video_menu_row_value(int row, char *out, size_t cap)
         else snprintf(value, sizeof(value), "%uP", s->internal_height);
         break;
     case R_AA:
-        strcpy(value, s->aa == PCV_AA_FXAA ? "FXAA" : s->aa == PCV_AA_SSAA ? "SSAA 4X" : "OFF");
+        strcpy(value, s->aa == PCV_AA_FXAA ? "FXAA" : s->aa == PCV_AA_SSAA ? "SSAA 4X" : s->aa == PCV_AA_DLAA ? "DLAA" :
+                s->aa == PCV_AA_DLSS_QUALITY ? "DLSS QUALITY" : s->aa == PCV_AA_DLSS_BALANCED ? "DLSS BALANCED" :
+                s->aa == PCV_AA_DLSS_PERFORMANCE ? "DLSS PERFORMANCE" : "OFF");
         break;
     case R_AF:
         if (s->af > 1) snprintf(value, sizeof(value), "%uX", s->af); else strcpy(value, "OFF");
@@ -654,7 +657,8 @@ const char *pc_video_menu_row_help(int row)
         if (!live) return video_menu_text("Anti-aliasing is available with the GPU renderer only.", "A suavização de serrilhado só está disponível no renderizador GPU.");
         if (cur.aa == PCV_AA_SSAA && pc_video_ssaa_factor_for(&cur) == 1)
             return video_menu_text("SSAA 4X is unavailable at this resolution. Lower the internal resolution to enable it.", "SSAA 4X não está disponível nesta resolução. Reduza a resolução interna para ativá-lo.");
-        return video_menu_text("FXAA smooths edges. SSAA 4X renders twice as wide and high for a cleaner picture.", "FXAA suaviza as bordas. SSAA 4X renderiza com o dobro da largura e da altura para uma imagem mais limpa.");
+        return video_menu_text("FXAA smooths edges; SSAA 4X is the cleanest. DLAA and DLSS need an RTX card; DLSS draws fewer pixels for speed.",
+                               "FXAA suaviza as bordas; SSAA 4X é a mais limpa. DLAA e DLSS exigem placa RTX; o DLSS desenha menos pixels e ganha velocidade.");
     case R_AF: return live ? video_menu_text("Keeps textures sharp on floors and walls seen at a slant.", "Mantém nítidas as texturas de pisos e paredes vistas de lado.") : video_menu_text("Anisotropic filtering is available with the GPU renderer only.", "A filtragem anisotrópica só está disponível no renderizador GPU.");
     case R_DOF: return live ? video_menu_text("Blurs the background. Higher is a wider, stronger blur.", "Desfoca o fundo. Valores maiores ampliam e intensificam o desfoque.") : video_menu_text("Depth of field is available with the GPU renderer only.", "A profundidade de campo só está disponível no renderizador GPU.");
     case R_SHARPEN: return live ? video_menu_text("Brings back fine detail softened by filters and scaling.", "Recupera detalhes finos suavizados pelos filtros e pela escala.") : video_menu_text("Sharpening is available with the GPU renderer only.", "A nitidez só está disponível no renderizador GPU.");
