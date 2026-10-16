@@ -44,11 +44,14 @@ static struct {
     float c58[4], c59[4], scale[4];
     unsigned frames, check;
     ID3D11Texture2D *out;               /* what the D3D12 passes wrote, at the raster size */
+    ID3D11Texture2D *in[3];             /* their inputs: the picture, the reflection weight and surface */
+    HANDLE in_h[3];
     ID3D11ShaderResourceView *out_srv;
     HANDLE out_h;
     unsigned out_w, out_hh;
     ID3D11PixelShader *ps_view;
     bool view;                          /* RECOMP_KGPU_RT_VIEW=1 */
+    bool reflect;                       /* ray-traced reflections (RECOMP_KGPU_RT_REFL=0 turns them off) */
     uint32_t first[KRT_DRAWS_MAX], count[KRT_DRAWS_MAX];
     uint8_t opaque[KRT_DRAWS_MAX];
 } s_rtc;
@@ -130,6 +133,8 @@ static bool kg_rtc_setup(void)
     s_rtc.check = e && *e && *e != '0';
     e = getenv("RECOMP_KGPU_RT_VIEW");
     s_rtc.view = e && *e && *e != '0';
+    e = getenv("RECOMP_KGPU_RT_REFL");
+    s_rtc.reflect = !(e && *e == '0');
     code = compile_hlsl("", kg_rtc_view_hlsl, "main", "ps_5_0");
     if (code) {
         ID3D11Device_CreatePixelShader(G.dev, ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code), NULL, &s_rtc.ps_view);
@@ -287,32 +292,58 @@ static void kg_rtc_check(const float *vp)
             s_rtc.ndraws, s_rtc.used / 3, s_rtc.overflow ? " (stream full)" : "", checked, worst);
 }
 
-/* The texture the D3D12 passes write, at the main target's raster size; made again when that size changes. */
-static bool kg_rtc_output(unsigned w, unsigned h)
+/* A texture D3D12 shares, by NT handle. */
+static bool kg_rtc_shared(unsigned w, unsigned h, DXGI_FORMAT fmt, UINT bind, ID3D11Texture2D **tex,
+                          ID3D11ShaderResourceView **srv, HANDLE *handle)
 {
     D3D11_TEXTURE2D_DESC td;
     IDXGIResource1 *r1 = NULL;
-    if (s_rtc.out && s_rtc.out_w == w && s_rtc.out_hh == h) return true;
-    SAFE_RELEASE(s_rtc.out_srv); SAFE_RELEASE(s_rtc.out);
-    if (s_rtc.out_h) { CloseHandle(s_rtc.out_h); s_rtc.out_h = NULL; }
-    s_rtc.out_w = s_rtc.out_hh = 0;
     memset(&td, 0, sizeof(td));
     td.Width = w; td.Height = h; td.MipLevels = td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT;
-    td.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+    td.Format = fmt; td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = bind | D3D11_BIND_SHADER_RESOURCE;
     td.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
-    if (FAILED(ID3D11Device_CreateTexture2D(G.dev, &td, NULL, &s_rtc.out)) ||
-        FAILED(ID3D11Device_CreateShaderResourceView(G.dev, (ID3D11Resource *)s_rtc.out, NULL, &s_rtc.out_srv)) ||
-        FAILED(ID3D11Texture2D_QueryInterface(s_rtc.out, &IID_IDXGIResource1, (void **)&r1)) ||
-        FAILED(IDXGIResource1_CreateSharedHandle(r1, NULL, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, NULL, &s_rtc.out_h)) ||
-        !krt_set_output(s_rtc.out_h, w, h)) {
+    if (FAILED(ID3D11Device_CreateTexture2D(G.dev, &td, NULL, tex)) ||
+        (srv && FAILED(ID3D11Device_CreateShaderResourceView(G.dev, (ID3D11Resource *)*tex, NULL, srv))) ||
+        FAILED(ID3D11Texture2D_QueryInterface(*tex, &IID_IDXGIResource1, (void **)&r1)) ||
+        FAILED(IDXGIResource1_CreateSharedHandle(r1, NULL, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, NULL, handle))) {
         if (r1) IDXGIResource1_Release(r1);
-        SAFE_RELEASE(s_rtc.out_srv); SAFE_RELEASE(s_rtc.out);
         return false;
     }
     IDXGIResource1_Release(r1);
+    return true;
+}
+
+static void kg_rtc_free_textures(void)
+{
+    unsigned i;
+    SAFE_RELEASE(s_rtc.out_srv); SAFE_RELEASE(s_rtc.out);
+    for (i = 0; i < 3; i++) SAFE_RELEASE(s_rtc.in[i]);
+    if (s_rtc.out_h) { CloseHandle(s_rtc.out_h); s_rtc.out_h = NULL; }
+    for (i = 0; i < 3; i++) if (s_rtc.in_h[i]) { CloseHandle(s_rtc.in_h[i]); s_rtc.in_h[i] = NULL; }
+    s_rtc.out_w = s_rtc.out_hh = 0;
+}
+
+/* What the D3D12 passes read and write, at the main target's raster size; made again when that size changes: the
+ * output, and the reflections' inputs (the picture, and the screen-space reflection targets' weight and surface,
+ * in their formats -- see ssr_targets). */
+static bool kg_rtc_output(unsigned w, unsigned h)
+{
+    static const DXGI_FORMAT in_fmt[3] = { DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT };
+    unsigned i;
+    if (s_rtc.out && s_rtc.out_w == w && s_rtc.out_hh == h) return true;
+    kg_rtc_free_textures();
+    if (!kg_rtc_shared(w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_UNORDERED_ACCESS, &s_rtc.out, &s_rtc.out_srv, &s_rtc.out_h))
+        goto fail;
+    for (i = 0; i < 3; i++)
+        if (!kg_rtc_shared(w, h, in_fmt[i], 0, &s_rtc.in[i], NULL, &s_rtc.in_h[i])) goto fail;
+    if (!krt_set_output(s_rtc.out_h, w, h) || !krt_set_inputs(s_rtc.in_h[0], s_rtc.in_h[1], s_rtc.in_h[2])) goto fail;
     s_rtc.out_w = w; s_rtc.out_hh = h;
     return true;
+fail:
+    fprintf(stderr, "[KRT] the %ux%u textures shared with D3D12 failed\n", w, h);
+    kg_rtc_free_textures();
+    return false;
 }
 
 /* The frame's world is drawn (cs is the main target, or NULL at a flip): turn what was captured into world space,
@@ -326,6 +357,7 @@ static void kg_rtc_finish(KGpuSurf *cs)
     ID3D11ShaderResourceView *none_srv = NULL;
     ID3D11UnorderedAccessView *none_uav = NULL;
     unsigned i;
+    bool sized;
     if (s_rtc.state <= 0 || s_rtc.done) return;
     s_rtc.done = true;
     if (!s_rtc.used || !(vp = kg_rtc_camera()) || !kg_rtc_invert(vp, cb.inv)) return;
@@ -357,11 +389,26 @@ static void kg_rtc_finish(KGpuSurf *cs)
     memcpy(f.inv, cb.inv, sizeof(f.inv));
     memcpy(f.c58, cb.c58, sizeof(f.c58));
     memcpy(f.c59, cb.c59, sizeof(f.c59));
+    memcpy(f.vp, vp, sizeof(f.vp));
+    f.zmax = 1.0f / s_rtc.scale[2];
     f.guest_w = 2.0f / s_rtc.scale[0]; f.guest_h = 2.0f / s_rtc.scale[1];
-    f.view = s_rtc.view && cs && kg_rtc_output(cs->hw, cs->hh);
-    if (krt_frame(&f) && f.view && s_rtc.ps_view && post_init()) {
+    sized = cs && kg_rtc_output(cs->hw, cs->hh);
+    f.view = s_rtc.view && sized;
+    /* reflections: when the env draws marked pixels this frame, at the picture's size and format */
+    f.reflect = s_rtc.reflect && sized && s_ssr.used && s_ssr.w == cs->hw && s_ssr.h == cs->hh &&
+                cs->dxfmt == DXGI_FORMAT_B8G8R8A8_UNORM;
+    if (f.reflect) {
+        ID3D11DeviceContext_CopyResource(G.ctx, (ID3D11Resource *)s_rtc.in[0], (ID3D11Resource *)cs->tex);
+        ID3D11DeviceContext_CopyResource(G.ctx, (ID3D11Resource *)s_rtc.in[1], (ID3D11Resource *)s_ssr.tex[0]);
+        ID3D11DeviceContext_CopyResource(G.ctx, (ID3D11Resource *)s_rtc.in[2], (ID3D11Resource *)s_ssr.tex[2]);
+    }
+    if (!krt_frame(&f)) return;
+    if (f.view && s_rtc.ps_view && post_init()) {
         post_pass(s_rtc.ps_view, cs->rtv, cs->hw, cs->hh, s_rtc.out_srv, NULL, NULL, NULL);
         kg_cache_invalidate();
+    } else if (f.reflect) {
+        s_ssr.rt_srv = s_rtc.out_srv;
+        s_ssr.rt_valid = true;
     }
 }
 

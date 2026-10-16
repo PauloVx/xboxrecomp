@@ -16,6 +16,7 @@
 #include <d3d11_4.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +26,7 @@
 #ifdef KRT_HAVE_SHADERS
 #include "krt_unpack.h"
 #include "krt_view.h"
+#include "krt_reflect.h"
 #endif
 
 #define KRT_RELEASE(p) do { if (p) { IUnknown_Release((IUnknown *)(p)); (p) = NULL; } } while (0)
@@ -47,7 +49,7 @@ enum {
 
 /* Constants a slot: the unpack pass's at 0, the frame's at 256. */
 typedef struct KrtUnpackCb { uint32_t n, width, pad[2]; } KrtUnpackCb;
-typedef struct KrtFrameCb { float inv[12], c58[4], c59[4], size[4]; } KrtFrameCb;
+typedef struct KrtFrameCb { float inv[12], c58[4], c59[4], size[4], vp0[4], vp1[4], vp3[4], zp[4]; } KrtFrameCb;
 
 static struct {
     bool ok;
@@ -67,7 +69,7 @@ static struct {
     uint64_t fence_value;
 
     ID3D12RootSignature *root;
-    ID3D12PipelineState *pso_unpack, *pso_view;
+    ID3D12PipelineState *pso_unpack, *pso_view, *pso_reflect;
     ID3D12DescriptorHeap *heap;
     UINT inc;
 
@@ -85,6 +87,7 @@ static struct {
     UINT64 blas_size, tlas_size, scratch_size;
     D3D12_RAYTRACING_GEOMETRY_DESC *geoms;
 
+    ID3D12Resource *in_pic, *in_w, *in_g; /* the reflections' inputs, written by D3D11 */
     ID3D12Resource *out;                /* written by the passes, read by D3D11 */
     unsigned out_w, out_h;
     bool said_frame;
@@ -191,7 +194,17 @@ static void write_trace_tables(void)
         d.Buffer.NumElements = KRT_DRAWS_MAX;
         d.Buffer.StructureByteStride = 4;
         ID3D12Device5_CreateShaderResourceView(K.dev, K.draws, &d, cpu_handle(t + 4));
-        for (i = 5; i < 8; i++) null_srv(t + i);
+        for (i = 5; i < 8; i++) {
+            static const DXGI_FORMAT fmt[3] = { DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R32G32B32A32_FLOAT };
+            ID3D12Resource *r = i == 5 ? K.in_w : i == 6 ? K.in_pic : K.in_g;
+            if (!r) { null_srv(t + i); continue; }
+            memset(&d, 0, sizeof(d));
+            d.Format = fmt[i - 5];
+            d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            d.Texture2D.MipLevels = 1;
+            ID3D12Device5_CreateShaderResourceView(K.dev, r, &d, cpu_handle(t + i));
+        }
     }
 }
 
@@ -208,9 +221,9 @@ void krt_shutdown(void)
 {
     unsigned i;
     release_scene();
-    KRT_RELEASE(K.geo); KRT_RELEASE(K.out);
+    KRT_RELEASE(K.geo); KRT_RELEASE(K.out); KRT_RELEASE(K.in_pic); KRT_RELEASE(K.in_w); KRT_RELEASE(K.in_g);
     KRT_RELEASE(K.draws); KRT_RELEASE(K.consts); KRT_RELEASE(K.instance);
-    KRT_RELEASE(K.pso_unpack); KRT_RELEASE(K.pso_view); KRT_RELEASE(K.root); KRT_RELEASE(K.heap);
+    KRT_RELEASE(K.pso_unpack); KRT_RELEASE(K.pso_view); KRT_RELEASE(K.pso_reflect); KRT_RELEASE(K.root); KRT_RELEASE(K.heap);
     KRT_RELEASE(K.list);
     for (i = 0; i < KRT_SLOTS; i++) KRT_RELEASE(K.alloc[i]);
     KRT_RELEASE(K.queue); KRT_RELEASE(K.fence); KRT_RELEASE(K.dev);
@@ -382,7 +395,8 @@ static bool make_pipelines(void)
     KRT_RELEASE(blob); KRT_RELEASE(errors);
     K.pso_unpack = make_pso(krt_unpack_cs, sizeof(krt_unpack_cs));
     K.pso_view = make_pso(krt_view_cs, sizeof(krt_view_cs));
-    if (!K.pso_unpack || !K.pso_view) { fprintf(stderr, "[KRT] compute pipelines failed\n"); return false; }
+    K.pso_reflect = make_pso(krt_reflect_cs, sizeof(krt_reflect_cs));
+    if (!K.pso_unpack || !K.pso_view || !K.pso_reflect) { fprintf(stderr, "[KRT] compute pipelines failed\n"); return false; }
 
     memset(&hd, 0, sizeof(hd));
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = H_COUNT;
@@ -520,9 +534,26 @@ bool krt_set_output(HANDLE texture, unsigned width, unsigned height)
     }
     K.out_w = width; K.out_h = height;
     memset(&d, 0, sizeof(d));
-    d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
     ID3D12Device5_CreateUnorderedAccessView(K.dev, K.out, NULL, &d, cpu_handle(H_TRACE_UAV));
+    return true;
+}
+
+bool krt_set_inputs(HANDLE picture, HANDLE weight, HANDLE surface)
+{
+    if (!K.ok) return false;
+    wait_fence(K.fence_value);
+    KRT_RELEASE(K.in_pic); KRT_RELEASE(K.in_w); KRT_RELEASE(K.in_g);
+    if (FAILED(ID3D12Device5_OpenSharedHandle(K.dev, picture, &IID_ID3D12Resource, (void **)&K.in_pic)) ||
+        FAILED(ID3D12Device5_OpenSharedHandle(K.dev, weight, &IID_ID3D12Resource, (void **)&K.in_w)) ||
+        FAILED(ID3D12Device5_OpenSharedHandle(K.dev, surface, &IID_ID3D12Resource, (void **)&K.in_g))) {
+        fprintf(stderr, "[KRT] D3D12 cannot open the reflection inputs\n");
+        KRT_RELEASE(K.in_pic); KRT_RELEASE(K.in_w); KRT_RELEASE(K.in_g);
+        write_trace_tables();
+        return false;
+    }
+    write_trace_tables();
     return true;
 }
 
@@ -605,6 +636,19 @@ bool krt_frame(const KrtFrame *f)
     memcpy(fc->c58, f->c58, sizeof(fc->c58));
     memcpy(fc->c59, f->c59, sizeof(fc->c59));
     fc->size[0] = (float)K.out_w; fc->size[1] = (float)K.out_h; fc->size[2] = f->guest_w; fc->size[3] = f->guest_h;
+    memcpy(fc->vp0, f->vp, sizeof(fc->vp0));
+    memcpy(fc->vp1, f->vp + 4, sizeof(fc->vp1));
+    memcpy(fc->vp3, f->vp + 12, sizeof(fc->vp3));
+    {
+        /* a perspective camera's z row is its w row scaled, plus a constant */
+        const float *zr = f->vp + 8, *wr = f->vp + 12;
+        int k, best = 0;
+        for (k = 1; k < 3; k++) if (fabsf(wr[k]) > fabsf(wr[best])) best = k;
+        fc->zp[0] = wr[best] != 0.0f ? zr[best] / wr[best] : 1.0f;
+        fc->zp[1] = zr[3] - fc->zp[0] * wr[3];
+        fc->zp[2] = f->zmax;
+        fc->zp[3] = 0.0f;
+    }
     memcpy(K.draws_cpu + K.slot * KRT_DRAWS_MAX, f->first, n * sizeof(uint32_t));
     memset(K.instance_cpu, 0, sizeof(*K.instance_cpu));
     K.instance_cpu->Transform[0][0] = K.instance_cpu->Transform[1][1] = K.instance_cpu->Transform[2][2] = 1.0f;
@@ -649,6 +693,22 @@ bool krt_frame(const KrtFrame *f)
     ID3D12GraphicsCommandList4_BuildRaytracingAccelerationStructure(K.list, &build, 0, NULL);
     uav_barrier(K.tlas);
 
+    if (f->reflect && !f->view && K.out && K.in_pic && K.in_w && K.in_g) {
+        ID3D12GraphicsCommandList4_SetPipelineState(K.list, K.pso_reflect);
+        ID3D12GraphicsCommandList4_SetComputeRootConstantBufferView(K.list, 0, cva + 256);
+        ID3D12GraphicsCommandList4_SetComputeRootDescriptorTable(K.list, 1, gpu_handle(H_TRACE_SRV + 8 * K.slot));
+        ID3D12GraphicsCommandList4_SetComputeRootDescriptorTable(K.list, 2, gpu_handle(H_TRACE_UAV));
+        barrier(K.in_pic, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        barrier(K.in_w, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        barrier(K.in_g, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        barrier(K.out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        ID3D12GraphicsCommandList4_Dispatch(K.list, (K.out_w + 7) / 8, (K.out_h + 7) / 8, 1);
+        barrier(K.out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+        barrier(K.in_g, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        barrier(K.in_w, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        barrier(K.in_pic, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        wrote = true;
+    }
     if (f->view && K.out) {
         ID3D12GraphicsCommandList4_SetPipelineState(K.list, K.pso_view);
         ID3D12GraphicsCommandList4_SetComputeRootConstantBufferView(K.list, 0, cva + 256);

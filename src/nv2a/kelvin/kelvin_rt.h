@@ -27,7 +27,8 @@ void krt_shutdown(void);
  * texels a vertex, see kelvin_gpu_rt.inc. It holds width * height / 2 vertices. */
 bool krt_set_geometry(HANDLE texture, unsigned width, unsigned height);
 
-/* The texture (RGBA8, created by D3D11 with unordered access, shared by NT handle) the passes write their results to. */
+/* The texture (RGBA16F, created by D3D11 with unordered access, shared by NT handle) the passes write their results
+ * to. */
 bool krt_set_output(HANDLE texture, unsigned width, unsigned height);
 
 /* One frame's captured world: `nverts` vertices, three a triangle, in `ndraws` draws of `count[i]` vertices from
@@ -40,9 +41,16 @@ typedef struct KrtFrame {
     const uint32_t *first, *count;
     const uint8_t *opaque;
     float inv[12], c58[4], c59[4];
+    float vp[16];                      /* the camera matrix itself, rows c[10..13] */
+    float zmax;                        /* the depth buffer's largest value */
     float guest_w, guest_h;
     bool view;                         /* RECOMP_KGPU_RT_VIEW: the camera's view, traced, into the output */
+    bool reflect;                      /* reflections for the pixels the screen-space targets marked */
 } KrtFrame;
+
+/* The per-frame inputs of the reflections, made by D3D11 at the output's size and shared by NT handle: the picture
+ * so far (BGRA8) and the screen-space reflection targets' weight (RGBA16F) and surface (RGBA32F). */
+bool krt_set_inputs(HANDLE picture, HANDLE weight, HANDLE surface);
 
 /* Called on the renderer's thread, after the D3D11 work that wrote the geometry texture has been issued. Builds the
  * scene's acceleration structure and runs the passes; D3D11 work issued afterwards waits for them. False if nothing
