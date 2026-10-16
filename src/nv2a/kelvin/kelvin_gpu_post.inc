@@ -391,7 +391,7 @@ static struct {
     unsigned int ss_w, ss_h;
     /* the settings in force (pc_video.c), read when its generation changes */
     unsigned int gen;
-    bool cfg;
+    bool cfg, split;
     int aa, dof, sharpen, ao_method, ao_quality;
     bool scene_fx;                                          /* any effect that runs on the scene */
     /* this frame */
@@ -839,9 +839,14 @@ static void kg_post_poll(void)
     const unsigned int gen = pc_video_generation();
     unsigned int i;
     PcVideoSettings v;
-    if (s_post.cfg && gen == s_post.gen) return;
+    if (s_post.cfg && gen == s_post.gen && kg_split() == s_post.split) return;
     pc_video_get(&v);
     s_post.gen = gen;
+    s_post.split = kg_split();
+    if (s_post.split) {
+        v.ao_method = PCV_AO_OFF; v.reflections = 0; v.dof = 0; v.sharpen = 0;
+        if (v.aa != PCV_AA_SSAA) v.aa = PCV_AA_OFF;
+    }
     if (!s_post.cfg) {
         const char *e = getenv("RECOMP_KGPU_DEPTH_STATS");
         s_post.depth_stats = e && *e ? atoi(e) : 0;

@@ -10,6 +10,7 @@
 #include "pc_movie_skip.h"
 #include "pc_photo.h"
 #include "pc_crosshair.h"
+#include "pc_split.h"
 #include "pc_debug.h"
 #if defined(_WIN32)
 #define COBJMACROS
@@ -842,6 +843,16 @@ static void fb_crosshair_draw(FbGpu *g, const FbPresentRect *r)
     if (!g->xh_ps || !g->xh_cb || !g->ovl_blend || pc_menu_active() || pc_photo_active() || !pc_crosshair_frame(&x)) return;
     constants[0] = (float)r->x + (float)r->width * 0.5f; constants[1] = (float)r->y + (float)r->height * 0.5f;
     constants[2] = (float)r->height / 1080.0f; constants[3] = (float)x.style;
+    if (pc_split_frame()) {
+        /* over player one's view, at the size of its HUD */
+        int v[4];
+        float sw, sh;
+        pc_split_rect(PCS_VIEW_HUD, v);
+        constants[0] = (float)r->x + (float)r->width * (float)(v[0] + v[2]) / 1280.0f;
+        constants[1] = (float)r->y + (float)r->height * (float)(v[1] + v[3]) / 960.0f;
+        sw = (float)(v[2] - v[0]) / 640.0f; sh = (float)(v[3] - v[1]) / 480.0f;
+        constants[2] *= sw < sh ? sw : sh;
+    }
     constants[4] = x.gap; constants[5] = x.length; constants[6] = x.thickness; constants[7] = x.alpha;
     constants[8] = x.marker_alpha; constants[9] = x.marker_inner; constants[10] = x.marker_outer;
     constants[11] = x.marker_kill ? 1.0f : 0.0f;

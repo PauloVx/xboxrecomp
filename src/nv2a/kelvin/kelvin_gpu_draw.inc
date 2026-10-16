@@ -455,12 +455,24 @@ again:
             ref = cs ? cs : zs;
             vp->TopLeftX = vp->TopLeftY = 0.0f; vp->Width = (FLOAT)ref->hw; vp->Height = (FLOAT)ref->hh;
             vp->MinDepth = 0.0f; vp->MaxDepth = 1.0f;
-            sc->left = (LONG)floor(t->clip_x0 * dc->sx); sc->top = (LONG)floor(t->clip_y0 * dc->sy);
-            sc->right = (LONG)ceil(t->clip_x1 * dc->sx); sc->bottom = (LONG)ceil(t->clip_y1 * dc->sy);
+            {
+                double cx0 = t->clip_x0, cy0 = t->clip_y0, cx1 = t->clip_x1, cy1 = t->clip_y1;
+                float vs, vx, vy;
+                if (kg_view_map(ref, &vs, &vx, &vy)) {
+                    vp->TopLeftX = (FLOAT)(vx * dc->sx); vp->TopLeftY = (FLOAT)(vy * dc->sy);
+                    vp->Width = (FLOAT)(ref->hw * vs); vp->Height = (FLOAT)(ref->hh * vs);
+                    cx0 = fmax(cx0 * vs + vx, s_view.rect[0]); cy0 = fmax(cy0 * vs + vy, s_view.rect[1]);
+                    cx1 = fmin(cx1 * vs + vx, s_view.rect[2]); cy1 = fmin(cy1 * vs + vy, s_view.rect[3]);
+                }
+                sc->left = (LONG)floor(cx0 * dc->sx); sc->top = (LONG)floor(cy0 * dc->sy);
+                sc->right = (LONG)ceil(cx1 * dc->sx); sc->bottom = (LONG)ceil(cy1 * dc->sy);
+            }
             if (sc->right > (LONG)ref->hw) sc->right = (LONG)ref->hw;
             if (sc->bottom > (LONG)ref->hh) sc->bottom = (LONG)ref->hh;
             if (sc->left < 0) sc->left = 0;
             if (sc->top < 0) sc->top = 0;
+            if (sc->right < sc->left) sc->right = sc->left;
+            if (sc->bottom < sc->top) sc->bottom = sc->top;
             dc->tex_ok = false;
         }
     }
@@ -472,7 +484,7 @@ again:
     kg_post_note_draw(ps, dc->cs, dc->zs);       /* the picture effects run when the HUD begins (kelvin_gpu_post.inc) */
     if (kg_dlss_take_refresh()) { dc->valid = false; goto again; }   /* the target changed size under this draw */
     /* a crosshair of the PC's replaces the game's aiming dot (pc_crosshair.c) */
-    if (s_post.done && post_main_target(dc->cs) && kg_hud_is_reticle(d) && pc_crosshair_replaces_dot()) return;
+    if ((s_post.done || s_view.mode == KG_VIEW_FIT) && post_main_target(dc->cs) && kg_hud_is_reticle(d) && pc_crosshair_replaces_dot()) return;
     if (dc->zs) {
         if (ps->depth_write || ps->stencil_write) dc->zs->real = true;
         depth_surface_refresh(dc->zs);

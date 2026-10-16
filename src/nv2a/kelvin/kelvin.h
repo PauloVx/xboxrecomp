@@ -27,6 +27,12 @@ int kelvin_active(void);
 int kelvin_mark_frame_aspect(uint32_t flip_data_va,
                             uint32_t aspect_w, uint32_t aspect_h);
 
+/* Split-screen: the draws from the pushbuffer word at `va` (the title's next write, as a physical-window VA) on go
+ * into a view (kgpu_set_view: mode KG_VIEW_*, rectangle x0, y0, x1, y1 of the 640x480 main target). The pusher
+ * applies the marks in the order they were made, behind the draws before them. Returns zero when the GPU backend is
+ * not running or the queue is full. */
+int kelvin_mark_view(uint32_t va, int mode, int x0, int y0, int x1, int y1);
+
 /* Start the GPU thread. Call once the NV2A aperture is mapped. */
 void kelvin_start(void);
 

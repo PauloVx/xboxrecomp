@@ -26,6 +26,7 @@
 #include "../../video/pc_video.h"
 #include "../../video/pc_crosshair.h"
 #include "../../video/pc_debug.h"
+#include "../../video/pc_split.h"
 
 #include "kelvin_gpu_hlsl.inc"
 
@@ -58,6 +59,11 @@ typedef struct VSG {
     float vm[4];                 /* x: viewmodel scale about the viewport centre (1 for none) */
     float jit[4];                /* xy: this frame's DLAA offset, clip units per unit w (kelvin_gpu_dlss.inc) */
 } VSG;
+
+/* The split-screen view (kgpu_set_view); `seen`: this frame used one, `prev`: the frame before did. */
+static struct { int mode; float rect[4]; bool seen, prev; } s_view;
+
+static bool kg_split(void) { return s_view.seen || s_view.prev; }
 
 static volatile uint32_t s_vm_hash[8];
 static volatile int s_vm_count;
@@ -1507,11 +1513,44 @@ static ID3D11Texture2D *feedback_copy(const KGpuSurf *s)
 static uint64_t s_cmp_frames;       /* flips seen by compare mode (G.frames only counts the GPU's own presented frames) */
 static bool readback(const KGpuSurf *cs, ID3D11Texture2D **stage_out, D3D11_MAPPED_SUBRESOURCE *ms);
 static void write_bmp(const char *path, const uint8_t *bgra, unsigned int w, unsigned int h, unsigned int pitch);
+
+/* The view's mapping of the main target `ref`, in guest pixels: p * s + (ox, oy). False when its draws are not mapped. */
+static bool kg_view_map(const KGpuSurf *ref, float *s, float *ox, float *oy)
+{
+    float rw, rh;
+    if (s_view.mode == KG_VIEW_FULL || !ref || ref->gw != 640 || ref->gh != 480) return false;
+    rw = s_view.rect[2] - s_view.rect[0];
+    rh = s_view.rect[3] - s_view.rect[1];
+    *s = s_view.mode == KG_VIEW_FIT ? fminf(rw / (float)ref->gw, rh / (float)ref->gh) : 1.0f;
+    *ox = (s_view.rect[0] + s_view.rect[2] - *s * (float)ref->gw) * 0.5f;
+    *oy = (s_view.rect[1] + s_view.rect[3] - *s * (float)ref->gh) * 0.5f;
+    return true;
+}
+
 #include "kelvin_gpu_post.inc"
 #include "kelvin_gpu_ssr.inc"
 #include "kelvin_gpu_draw.inc"
 #include "kelvin_gpu_rt.inc"
 #include "kelvin_gpu_dlss.inc"
+
+void kgpu_set_view(int mode, int x0, int y0, int x1, int y1)
+{
+    s_view.mode = mode;
+    s_view.rect[0] = (float)x0; s_view.rect[1] = (float)y0;
+    s_view.rect[2] = (float)x1; s_view.rect[3] = (float)y1;
+    if (mode != KG_VIEW_FULL) s_view.seen = true;
+    kg_cache_invalidate();
+}
+
+/* At a flip: the next frame starts on the whole target. */
+static void kg_view_after_flip(void)
+{
+    pc_split_note_frame(s_view.seen);
+    s_view.prev = s_view.seen;
+    s_view.seen = false;
+    s_view.mode = KG_VIEW_FULL;
+    kg_cache_invalidate();
+}
 
 /* ---- clears ------------------------------------------------------------------------------------- */
 
@@ -1537,6 +1576,13 @@ static void kgpu_clear_now(const KelvinTarget *t, bool color, bool depth, bool s
                 (int)color, (int)depth, (int)stencil, x0, y0, x1, y1, t->width, t->height);
     if (cs) { cs->ver++; cs->wseq = ++s_wseq; }
     if (zs) { zs->real = true; zs->from_color = false; zs->ver++; zs->wseq = ++s_wseq; }
+    {
+        float vs, vx, vy;
+        if (kg_view_map(cs ? cs : zs, &vs, &vx, &vy)) {
+            x0 = (int)fmaxf(floorf(x0 * vs + vx), s_view.rect[0]); y0 = (int)fmaxf(floorf(y0 * vs + vy), s_view.rect[1]);
+            x1 = (int)fminf(ceilf(x1 * vs + vx), s_view.rect[2]); y1 = (int)fminf(ceilf(y1 * vs + vy), s_view.rect[3]);
+        }
+    }
     /* the rectangle arrives in guest-stored pixels */
     x0 = (int)floor(x0 * sx); y0 = (int)floor(y0 * sy);
     x1 = (int)ceil(x1 * sx); y1 = (int)ceil(y1 * sy);
@@ -2056,6 +2102,7 @@ static void kgpu_flip_now(const KelvinTarget *t, unsigned int color_format, uint
     kg_post_before_flip(t, color_format);
     kgpu_flip_inner(t, color_format, aspect_w, aspect_h);
     kg_post_after_flip();
+    kg_view_after_flip();
     kg_apply_pending_size();
 }
 

@@ -227,6 +227,7 @@ static bool kg_rtc_wanted(void)
 
 static bool kg_rtc_on(void)
 {
+    if (kg_split()) return false;
     if (s_rtc.state == 0) s_rtc.state = kg_rtc_setup() ? 1 : -1;
     return s_rtc.state > 0;
 }

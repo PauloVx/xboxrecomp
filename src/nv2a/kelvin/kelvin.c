@@ -117,6 +117,67 @@ static void frame_aspect_for_method(uint32_t parameter_va, uint32_t method)
     ReleaseSRWLockExclusive(&s_frame_aspects_lock);
 }
 
+/* Split-screen view marks, oldest first. A mark whose word the pusher passed without matching (none should) is
+ * dropped when a later one matches. */
+#define KELVIN_VIEW_CAPACITY 16
+typedef struct ViewMark {
+    uint32_t va;
+    uint64_t rect;
+    int mode;
+} ViewMark;
+static ViewMark s_view_marks[KELVIN_VIEW_CAPACITY];
+static SRWLOCK s_view_marks_lock = SRWLOCK_INIT;
+static volatile LONG s_view_marks_count;
+
+static void view_thunk(uintptr_t rect, uintptr_t mode)
+{
+    kgpu_set_view((int)mode, (int)(rect & 0xFFFF), (int)((rect >> 16) & 0xFFFF),
+                  (int)((rect >> 32) & 0xFFFF), (int)((rect >> 48) & 0xFFFF));
+}
+
+int kelvin_mark_view(uint32_t va, int mode, int x0, int y0, int x1, int y1)
+{
+    int marked = 0;
+    if (!kgpu_active() || (va & 3u) || va < KELVIN_PHYS_WINDOW ||
+        (uint64_t)va + 4u > (uint64_t)KELVIN_PHYS_WINDOW + KELVIN_PHYS_SIZE ||
+        x0 < 0 || y0 < 0 || x1 > 0xFFFF || y1 > 0xFFFF || x1 <= x0 || y1 <= y0)
+        return 0;
+    AcquireSRWLockExclusive(&s_view_marks_lock);
+    if (s_view_marks_count < KELVIN_VIEW_CAPACITY) {
+        ViewMark *m = &s_view_marks[s_view_marks_count];
+        m->va = va;
+        m->rect = (uint64_t)x0 | (uint64_t)y0 << 16 | (uint64_t)x1 << 32 | (uint64_t)y1 << 48;
+        m->mode = mode;
+        InterlockedExchange(&s_view_marks_count, s_view_marks_count + 1);
+        marked = 1;
+    }
+    ReleaseSRWLockExclusive(&s_view_marks_lock);
+    return marked;
+}
+
+static void view_for_word(uint32_t va)
+{
+    LONG i, n, k;
+#ifdef _MSC_VER
+    if (!ReadAcquire(&s_view_marks_count)) return;
+#else
+    if (!__atomic_load_n(&s_view_marks_count, __ATOMIC_ACQUIRE)) return;
+#endif
+    AcquireSRWLockExclusive(&s_view_marks_lock);
+    n = s_view_marks_count;
+    for (i = n - 1; i >= 0 && s_view_marks[i].va != va; --i) {}
+    if (i >= 0) {
+        for (k = 0; k <= i; ++k) {
+            if (s_view_marks[k].va != va) continue;
+            if (kgpu_async_active()) kgpu_defer_call(view_thunk, (uintptr_t)s_view_marks[k].rect, (uintptr_t)s_view_marks[k].mode);
+            else view_thunk((uintptr_t)s_view_marks[k].rect, (uintptr_t)s_view_marks[k].mode);
+        }
+        for (k = i + 1; k < n; ++k) s_view_marks[k - i - 1] = s_view_marks[k];
+        InterlockedExchange(&s_view_marks_count, n - i - 1);
+    }
+    ReleaseSRWLockExclusive(&s_view_marks_lock);
+}
+
 /* ---- guest memory ---------------------------------------------------------- */
 
 uint8_t *kelvin_guest(uint32_t va)
@@ -544,6 +605,7 @@ static uint32_t pusher_run(KelvinState *pg, uint32_t put)
         words++;
         pg->stats.words++;
         frame_aspect_for_method(va, s_push.count ? s_push.method : UINT32_MAX);
+        if (!s_push.count) view_for_word(va);
 
         if (s_push.count) {
             g_kelvin_word_get = s_push.get - 4;
