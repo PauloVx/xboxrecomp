@@ -488,7 +488,8 @@ again:
     kg_post_note_draw(ps, dc->cs, dc->zs);       /* the picture effects run when the HUD begins (kelvin_gpu_post.inc) */
     if (kg_dlss_take_refresh()) { dc->valid = false; goto again; }   /* the target changed size under this draw */
     /* a crosshair of the PC's replaces the game's aiming dot (pc_crosshair.c) */
-    if ((s_post.done || s_view.mode == KG_VIEW_FIT) && post_main_target(dc->cs) && kg_hud_is_reticle(d) && pc_crosshair_replaces_dot()) return;
+    if ((s_post.done || s_view.mode == KG_VIEW_FIT) && post_main_target(dc->cs) && kg_hud_is_reticle(d) &&
+        pc_crosshair_replaces_dot_for(s_view.mode == KG_VIEW_FIT && (s_view.rect[0] > 0.0f || s_view.rect[1] > 0.0f))) return;
     if (dc->zs) {
         if (ps->depth_write || ps->stencil_write) dc->zs->real = true;
         depth_surface_refresh(dc->zs);

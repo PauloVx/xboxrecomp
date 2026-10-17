@@ -37,6 +37,7 @@ void pc_crosshair_hit_for(int player, int kind);
 /* Whether the game's own aiming dot should go: another style is chosen, the player is in control and not aiming
  * down the sights (where the dot comes back, as the crosshair goes). */
 int pc_crosshair_replaces_dot(void);
+int pc_crosshair_replaces_dot_for(int player);
 /* Seconds since the player last fired, a large number before the first shot. */
 double pc_crosshair_since_shot(void);
 /* Presenter: the crosshair and marker to draw now. 0 when there is nothing (another style, no control, paused...). */

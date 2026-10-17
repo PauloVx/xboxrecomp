@@ -103,17 +103,20 @@ void pc_crosshair_hit_for(int player, int kind)
 
 void pc_crosshair_hit(int kind) { pc_crosshair_hit_for(0, kind); }
 
-int pc_crosshair_replaces_dot(void)
+int pc_crosshair_replaces_dot_for(int player)
 {
     PcVideoSettings v;
     int replaces;
     pc_video_get(&v);
-    if (v.crosshair == PCX_ORIGINAL) return 0;
+    if (v.crosshair == PCX_ORIGINAL || player < 0 || player > 1) return 0;
     AcquireSRWLockShared(&s_lock);
-    replaces = s_aim[0].control && now_seconds() - s_aim[0].last_tick < CONTROL_TIMEOUT && s_aim[0].zoom >= 0.9f;
+    replaces = s_aim[player].control && now_seconds() - s_aim[player].last_tick < CONTROL_TIMEOUT &&
+               s_aim[player].zoom >= 0.9f;
     ReleaseSRWLockShared(&s_lock);
     return replaces;
 }
+
+int pc_crosshair_replaces_dot(void) { return pc_crosshair_replaces_dot_for(0); }
 
 double pc_crosshair_since_shot(void)
 {
@@ -179,6 +182,7 @@ void pc_crosshair_hit(int kind) { (void)kind; }
 void pc_crosshair_hit_for(int player, int kind) { (void)player; (void)kind; }
 double pc_crosshair_since_shot(void) { return 1e9; }
 int pc_crosshair_replaces_dot(void) { return 0; }
+int pc_crosshair_replaces_dot_for(int player) { (void)player; return 0; }
 int pc_crosshair_frame(PcCrosshairDraw *out) { memset(out, 0, sizeof(*out)); return 0; }
 void pc_crosshair_test_clock(double (*now)(void)) { (void)now; }
 #endif
