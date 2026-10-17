@@ -29,8 +29,11 @@ typedef struct PcCrosshairDraw {
 /* Game thread, once per update. shots: the mission's bullets fired so far (it may restart at 0). zoom: the camera's
  * zoom compensation, 1 unzoomed and smaller when aiming. */
 void pc_crosshair_tick(int in_control, float speed, unsigned shots, float zoom);
+/* Split-screen: player 1 is player two, with a crosshair and hit markers of its own. */
+void pc_crosshair_tick_for(int player, int in_control, float speed, unsigned shots, float zoom);
 /* Any thread: something the player shot was hit (PCX_MARK_HIT) or killed (PCX_MARK_KILL). */
 void pc_crosshair_hit(int kind);
+void pc_crosshair_hit_for(int player, int kind);
 /* Whether the game's own aiming dot should go: another style is chosen, the player is in control and not aiming
  * down the sights (where the dot comes back, as the crosshair goes). */
 int pc_crosshair_replaces_dot(void);
@@ -38,6 +41,7 @@ int pc_crosshair_replaces_dot(void);
 double pc_crosshair_since_shot(void);
 /* Presenter: the crosshair and marker to draw now. 0 when there is nothing (another style, no control, paused...). */
 int pc_crosshair_frame(PcCrosshairDraw *out);
+int pc_crosshair_frame_for(int player, PcCrosshairDraw *out);
 
 /* Tests: a clock in seconds instead of the performance counter (NULL restores it). */
 void pc_crosshair_test_clock(double (*now)(void));

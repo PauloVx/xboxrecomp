@@ -850,17 +850,19 @@ static void fb_crosshair_draw(FbGpu *g, const FbPresentRect *r)
     ID3D11DeviceContext_OMSetBlendState(g->context, g->ovl_blend, factor, 0xFFFFFFFFu);
     ID3D11DeviceContext_PSSetShader(g->context, g->xh_ps, NULL, 0);
     ID3D11DeviceContext_PSSetConstantBuffers(g->context, 0, 1, &g->xh_cb);
-    /* split-screen: one over each player's view, at the size of its HUD; the hit markers are player one's */
+    /* split-screen: one over each player's view, at the size of its HUD, each with its own spread and
+     * hit markers */
     for (player = 0; player < (split ? 2 : 1); player++) {
         int v[4];
         float sw, sh;
+        if (player && !pc_crosshair_frame_for(1, &x)) continue;
         pc_split_rect_for(split, player, v);
         constants[0] = (float)r->x + (float)r->width * (float)(v[0] + v[2]) / 1280.0f;
         constants[1] = (float)r->y + (float)r->height * (float)(v[1] + v[3]) / 960.0f;
         sw = (float)(v[2] - v[0]) / 640.0f; sh = (float)(v[3] - v[1]) / 480.0f;
         constants[2] = (float)r->height / 1080.0f * (sw < sh ? sw : sh); constants[3] = (float)x.style;
         constants[4] = x.gap; constants[5] = x.length; constants[6] = x.thickness; constants[7] = x.alpha;
-        constants[8] = player ? 0.0f : x.marker_alpha; constants[9] = x.marker_inner; constants[10] = x.marker_outer;
+        constants[8] = x.marker_alpha; constants[9] = x.marker_inner; constants[10] = x.marker_outer;
         constants[11] = x.marker_kill ? 1.0f : 0.0f;
         ID3D11DeviceContext_UpdateSubresource(g->context, (ID3D11Resource *)g->xh_cb, 0, NULL, constants, 0, 0);
         ID3D11DeviceContext_Draw(g->context, 3, 0);
