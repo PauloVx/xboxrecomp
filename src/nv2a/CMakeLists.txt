@@ -22,6 +22,7 @@ add_library(xbox_nv2a STATIC
     kelvin/kelvin_vsh.c
     kelvin/kelvin_pixel.c
     kelvin/kelvin_texture.c
+    kelvin/kelvin_texpack.c
     kelvin/kelvin_workers.c
     kelvin/nv2a_vsh_cpu/nv2a_vsh_cpu.c
     kelvin/nv2a_vsh_cpu/nv2a_vsh_disassembler.c

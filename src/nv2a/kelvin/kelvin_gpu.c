@@ -11,6 +11,7 @@
 #include <dxgi1_4.h>
 #include <d3dcompiler.h>
 #include "kelvin_rt.h"
+#include "kelvin_texpack.h"
 #include <intrin.h>
 #include <nmmintrin.h>
 #include <tlhelp32.h>
@@ -1308,6 +1309,38 @@ static void tex_signature(const KTexture *t, uint32_t span, uint64_t sig[2])
     }
 }
 
+/* Replacement textures (kelvin_texpack.c): the pack's file for each texture content, -1 none; decided once a content.
+ * A paletted texture is decided by its texels alone, so palette animation keeps one decision. Only swizzled textures
+ * (sampled with normalised coordinates) of at least 16x16 are looked at. */
+#define KG_TP_SLOTS 65536u
+static struct KgTpSeen { uint64_t k0, k1; int index; bool used; } *s_tp_seen;
+
+static int tex_pack_index(const KTexture *t, uint32_t span, const uint64_t sig[2], bool dxt, uint32_t *have)
+{
+    uint64_t key[2];
+    unsigned slot, probes;
+    uint32_t *px = have;
+    int index;
+    if (!ktp_enabled() || t->linear || t->cubemap || t->depth_format || t->host || t->width < 16 || t->height < 16) return -1;
+    if (!s_tp_seen && !(s_tp_seen = (struct KgTpSeen *)calloc(KG_TP_SLOTS, sizeof(*s_tp_seen)))) return -1;
+    if (t->kind == TK_I8) sig_bytes(t->mem, span, key);
+    else { key[0] = sig[0]; key[1] = sig[1]; }
+    key[0] ^= ((uint64_t)t->width << 48) ^ ((uint64_t)t->height << 32) ^ t->color_format;
+    for (probes = 0, slot = (unsigned)(key[0] % KG_TP_SLOTS); probes < 64; probes++, slot = (slot + 1) % KG_TP_SLOTS) {
+        struct KgTpSeen *s = &s_tp_seen[slot];
+        if (!s->used) break;
+        if (s->k0 == key[0] && s->k1 == key[1]) return s->index;
+    }
+    if (!px && !(px = (uint32_t *)malloc((size_t)t->width * t->height * 4))) return -1;
+    if (px != have) { if (dxt) decode_dxt_level(t, 0, px); else decode_level(t, 0, px); }
+    index = ktp_match(px, t->width, t->height);
+    if (px != have) free(px);
+    if (probes < 64) {
+        s_tp_seen[slot].k0 = key[0]; s_tp_seen[slot].k1 = key[1]; s_tp_seen[slot].index = index; s_tp_seen[slot].used = true;
+    }
+    return index;
+}
+
 /* Create or refresh the cached GPU copy of a texture; the SRV to bind. */
 static ID3D11ShaderResourceView *tex_get(const KTexture *t)
 {
@@ -1350,6 +1383,37 @@ static ID3D11ShaderResourceView *tex_get(const KTexture *t)
         tex_free(e);
     } else {
         tex_signature(t, span, sig);
+    }
+
+    {
+        const int pack = tex_pack_index(t, span, sig, dxt, NULL);
+        ID3D11Texture2D *tex = NULL;
+        ID3D11ShaderResourceView *srv = NULL;
+        size_t bytes = 0;
+        const bool shared = krt_available();
+        if (pack >= 0 && ktp_texture(G.dev, pack, shared ? D3D11_USAGE_DEFAULT : D3D11_USAGE_IMMUTABLE,
+                                     shared ? D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE : 0,
+                                     &tex, &srv, &bytes)) {
+            e->used = true;
+            e->base = t->base; e->fmt = t->color_format; e->w = t->width; e->h = t->height;
+            e->pitch = t->pitch; e->levels = levels; e->palette = t->palette; e->palette_len = t->palette_len;
+            e->span = span; e->sig[0] = sig[0]; e->sig[1] = sig[1];
+            e->epoch = G.epoch; e->clock = G.clock;
+            e->tex = tex; e->srv = srv;
+            e->rt_h = NULL; e->rt_index = -1;
+            if (shared) {
+                IDXGIResource1 *r1 = NULL;
+                if (SUCCEEDED(ID3D11Texture2D_QueryInterface(tex, &IID_IDXGIResource1, (void **)&r1))) {
+                    if (FAILED(IDXGIResource1_CreateSharedHandle(r1, NULL, DXGI_SHARED_RESOURCE_READ, NULL, &e->rt_h))) e->rt_h = NULL;
+                    IDXGIResource1_Release(r1);
+                }
+            }
+            /* the pack keeps the file's texture: what this entry holds is a reference */
+            e->bytes = 64;
+            G.tex_bytes += e->bytes;
+            G.tex_uploads++;
+            return e->srv;
+        }
     }
 
     memset(&td, 0, sizeof(td));
