@@ -15,6 +15,10 @@
 #include <d3d11_4.h>
 
 bool ktp_enabled(void);
+/* Whether the pack came with a map (RECOMP_TEXTURE_PACK_MAP): then ktp_lookup decides, not ktp_match. */
+bool ktp_mapped(void);
+/* The pack file the map gives a game texture: FNV-1a of its top level's bytes (64-bit words), size and format. */
+int ktp_lookup(uint64_t key, unsigned w, unsigned h, unsigned fmt);
 /* The pack file that replaces a game texture whose top level is `rgba` (w x h, R in the low byte), or -1. */
 int ktp_match(const uint32_t *rgba, unsigned w, unsigned h);
 /* That file's texture, made on first use with `usage` and `misc`; a reference for the caller to release, or NULL. */

@@ -1331,10 +1331,22 @@ static int tex_pack_index(const KTexture *t, uint32_t span, const uint64_t sig[2
         if (!s->used) break;
         if (s->k0 == key[0] && s->k1 == key[1]) return s->index;
     }
-    if (!px && !(px = (uint32_t *)malloc((size_t)t->width * t->height * 4))) return -1;
-    if (px != have) { if (dxt) decode_dxt_level(t, 0, px); else decode_level(t, 0, px); }
-    index = ktp_match(px, t->width, t->height);
-    if (px != have) free(px);
+    if (ktp_mapped()) {
+        /* the map's key: FNV-1a over the top level's bytes as 64-bit words */
+        const size_t top = dxt ? (size_t)(t->width / 4) * (t->height / 4) * (t->kind == TK_DXT1 ? 8 : 16)
+                         : t->kind == TK_I8 ? (size_t)t->width * t->height : 0;
+        const uint8_t *m = (const uint8_t *)t->mem;
+        uint64_t fnv = 0xcbf29ce484222325ull, word;
+        size_t i;
+        if (!top || (top & 7) || top > span) return -1;
+        for (i = 0; i < top; i += 8) { memcpy(&word, m + i, 8); fnv = (fnv ^ word) * 0x100000001b3ull; }
+        index = ktp_lookup(fnv, t->width, t->height, t->color_format);
+    } else {
+        if (!px && !(px = (uint32_t *)malloc((size_t)t->width * t->height * 4))) return -1;
+        if (px != have) { if (dxt) decode_dxt_level(t, 0, px); else decode_level(t, 0, px); }
+        index = ktp_match(px, t->width, t->height);
+        if (px != have) free(px);
+    }
     if (probes < 64) {
         s_tp_seen[slot].k0 = key[0]; s_tp_seen[slot].k1 = key[1]; s_tp_seen[slot].index = index; s_tp_seen[slot].used = true;
     }

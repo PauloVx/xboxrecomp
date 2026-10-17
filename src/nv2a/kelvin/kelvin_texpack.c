@@ -34,12 +34,21 @@ typedef struct KtpFile {
     size_t bytes;
 } KtpFile;
 
+/* A map entry: a game texture (FNV-1a of its top level, its size and format) and the pack file that replaces it. */
+typedef struct KtpMapped {
+    uint64_t key;
+    uint32_t w, h, fmt;
+    int file;
+} KtpMapped;
+
 static struct {
     int state;                         /* 0 not looked at, 1 ready, -1 off */
     wchar_t root[MAX_PATH];
     KtpFile *files;
     unsigned count, cap;
     IWICImagingFactory *wic;
+    KtpMapped *map;                    /* sorted by key; NULL when the pack has no map */
+    unsigned mapped;
 } K;
 
 /* ---- pictures ----------------------------------------------------------------------------------------------- */
@@ -392,6 +401,64 @@ static void ktp_index(void)
     fprintf(stderr, "[TEXPACK] %u files, %u looked at now\n", K.count, fresh);
 }
 
+static int ktp_map_order(const void *a, const void *b)
+{
+    const KtpMapped *x = (const KtpMapped *)a, *y = (const KtpMapped *)b;
+    if (x->key != y->key) return x->key < y->key ? -1 : 1;
+    if (x->w != y->w) return x->w < y->w ? -1 : 1;
+    if (x->h != y->h) return x->h < y->h ? -1 : 1;
+    return x->fmt < y->fmt ? -1 : x->fmt > y->fmt;
+}
+
+/* RECOMP_TEXTURE_PACK_MAP names the pack's map (textures/black-hd-reimagined.map): lines of key, width, height,
+ * format (hex) and the pack file's name. Files the pack does not have are left out. */
+static void ktp_load_map(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    char line[512];
+    unsigned cap = 0, missing = 0;
+    if (!f) { fprintf(stderr, "[TEXPACK] no map at %s\n", path); return; }
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long long key;
+        unsigned w, h, fmt, i;
+        char name[260];
+        wchar_t wname[260];
+        int at = -1;
+        if (line[0] == '#' || sscanf(line, "%llx %u %u %x %259s", &key, &w, &h, &fmt, name) != 5) continue;
+        if (MultiByteToWideChar(CP_UTF8, 0, name, -1, wname, 260) <= 0) continue;
+        for (i = 0; i < K.count && at < 0; i++) {
+            const wchar_t *base = wcsrchr(K.files[i].path, L'\\');
+            if (!_wcsicmp(base ? base + 1 : K.files[i].path, wname)) at = (int)i;
+        }
+        if (at < 0) { missing++; continue; }
+        if (K.mapped == cap) {
+            KtpMapped *grown = (KtpMapped *)realloc(K.map, (cap ? cap * 2 : 1024) * sizeof(KtpMapped));
+            if (!grown) break;
+            K.map = grown; cap = cap ? cap * 2 : 1024;
+        }
+        K.map[K.mapped].key = key; K.map[K.mapped].w = w; K.map[K.mapped].h = h; K.map[K.mapped].fmt = fmt;
+        K.map[K.mapped].file = at;
+        K.mapped++;
+    }
+    fclose(f);
+    if (K.map) qsort(K.map, K.mapped, sizeof(KtpMapped), ktp_map_order);
+    fprintf(stderr, "[TEXPACK] map: %u textures, %u files the pack does not have\n", K.mapped, missing);
+}
+
+bool ktp_mapped(void)
+{
+    return ktp_enabled() && K.map != NULL;
+}
+
+int ktp_lookup(uint64_t key, unsigned w, unsigned h, unsigned fmt)
+{
+    KtpMapped want, *hit;
+    if (!ktp_mapped()) return -1;
+    want.key = key; want.w = w; want.h = h; want.fmt = fmt;
+    hit = (KtpMapped *)bsearch(&want, K.map, K.mapped, sizeof(KtpMapped), ktp_map_order);
+    return hit ? hit->file : -1;
+}
+
 bool ktp_enabled(void)
 {
     if (K.state == 0) {
@@ -402,8 +469,11 @@ bool ktp_enabled(void)
             while (n && (K.root[n - 1] == L'\\' || K.root[n - 1] == L'/')) K.root[--n] = 0;
             ktp_scan(K.root, 0);
             if (K.count) {
+                const char *map = getenv("RECOMP_TEXTURE_PACK_MAP");
                 qsort(K.files, K.count, sizeof(KtpFile), ktp_order);
-                ktp_index();
+                /* with a map the files are found by name; without one, by look (fingerprints) */
+                if (map && *map) ktp_load_map(map);
+                if (!K.map) ktp_index();
                 K.state = 1;
             } else fprintf(stderr, "[TEXPACK] no DDS or PNG files under %s\n", dir);
         }
