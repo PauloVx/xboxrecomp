@@ -183,7 +183,7 @@ static bool kg_rtc_setup(void)
     s_rtc.ao = e && *e ? (float)atof(e) : 0.6f;
     s_rtc.ao_radius = 1.5f;
     e = getenv("RECOMP_KGPU_RT_GI");
-    s_rtc.gi = e && *e ? (float)atof(e) : 0.5f;
+    s_rtc.gi = e && *e ? (float)atof(e) : 2.0f;
     e = getenv("RECOMP_KGPU_RT_REFL");
     s_rtc.reflect = !(e && *e == '0');
     code = compile_hlsl("", kg_rtc_view_hlsl, "main", "ps_5_0");
