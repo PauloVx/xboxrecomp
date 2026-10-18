@@ -121,16 +121,18 @@ int pc_controls_pad_layout_step(int dir)
 int pc_controls_pad_bind(PcAction action, int control)
 {
     const int slot = pc_controls_action_slot(action);
+    const int restoring = control < 0;
     int old, a;
     pc_controls_load();
     if (!pc_controls_pad_action(action) || slot < 0) return 0;
-    if (control < 0) {
-        s_override[slot] = -1;
-        changed();
+    /* Restoring a default can displace the action that took this button in an earlier swap. */
+    if (restoring) control = preset_control(layout_preset(), slot);
+    if (!pc_controls_pad_bindable(control) || (old = slot_control(slot)) < 0) return 0;
+    if (old == control) {
+        /* A loaded explicit default must stop pinning this button when the profile changes presets. */
+        if (restoring) { s_override[slot] = -1; changed(); }
         return 1;
     }
-    if (!pc_controls_pad_bindable(control) || (old = slot_control(slot)) < 0) return 0;
-    if (old == control) return 1;
     /* a listed action that had this control takes this one's old control */
     for (a = 0; a < PC_ACTION_COUNT; a++) {
         const int other = pc_controls_action_slot((PcAction)a);

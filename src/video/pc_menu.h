@@ -112,6 +112,10 @@ void pc_menu_request_video(void);
 
 /* A native page is on screen (any thread). */
 int pc_menu_active(void);
+/* Window thread: the pointer moved to (x, y) in client pixels, the same space as pc_menu_overlay's picture
+ * rectangle. On a native page the item under it takes the focus, and a left click acts on that item
+ * (confirm; ON/OFF and sliders by where the click lands); a click away from the items does nothing. */
+void pc_menu_pointer(int x, int y);
 
 /* 1 when the player used a native page (a key, button or stick) since the last call; clears it (any thread). A
  * native page takes all input, so the game's own idle checks (an attract mode) would see none: the game project
@@ -150,6 +154,10 @@ const char *pc_menu_definition_path(void);
 
 /* START is the pad's start button: back on a page with "start = back", confirm elsewhere (as the original). */
 enum { PCM_ACT_UP = 1, PCM_ACT_DOWN, PCM_ACT_LEFT, PCM_ACT_RIGHT, PCM_ACT_CONFIRM, PCM_ACT_BACK, PCM_ACT_START, PCM_ACT_VIDEO };
+/* Tests: the menu-space to pixel mapping the pointer uses, as pc_menu_test_render sets it for w x h. */
+void pc_menu_test_pointer_space(unsigned w, unsigned h);
+void pc_menu_test_button(int button, int down);  /* a mouse button, through the native page's input filter */
+int pc_menu_test_pointer_item(void);              /* the item under the pointer, -1 none */
 void pc_menu_test_reset(const char *definition);   /* forget state, use this definition (no file) */
 void pc_menu_test_action(int action);              /* as if the player pressed it */
 int pc_menu_test_focus(void);                      /* index of the focused item, -1 none */

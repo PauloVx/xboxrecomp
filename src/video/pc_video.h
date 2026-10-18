@@ -59,6 +59,7 @@ typedef struct PcVideoSettings {
     unsigned aspect;                          /* PCV_ASPECT_* */
     double fov;                               /* vertical degrees (35..120) or 0 = the game's own */
     unsigned motion_blur_off;
+    unsigned action_blur_off;                 /* BLACK's own reload/aim blur (the game's hook reads it) */
     unsigned aa;                              /* PCV_AA_* */
     unsigned af;                              /* anisotropic filtering: 1 (off), 2, 4, 8 or 16 */
     unsigned dof;                             /* depth of field, PCV_STEP_* */

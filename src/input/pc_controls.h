@@ -28,7 +28,7 @@ extern "C" {
 enum { PCC_PRESETS = 4, PCC_SLOTS = 37, PCC_CONTROLS = 28 };
 
 typedef struct PcControlsGame {
-    /* The control a preset gives a slot (0..27), -1 when the presets cannot be read yet. */
+    /* The control a preset gives a slot (0..27, 28 = none), -1 when the presets cannot be read yet. */
     int (*preset_control)(int preset, int slot);
     /* The layout changed: write it into the live map now (when there is one). */
     void (*apply)(void);

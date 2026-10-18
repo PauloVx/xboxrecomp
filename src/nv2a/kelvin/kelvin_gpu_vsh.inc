@@ -560,6 +560,9 @@ static bool vs_try_cache(KGpuVs *e)
 
 /* ---- the manifest of the programs met so far ---- */
 
+#include <errno.h>
+#include <io.h>
+
 #define KG_MAN_MAGIC 0x3153564Bu       /* "KVS1"; a record is magic, source hash, source length, word count, words */
 #define KG_MAN_MAX 4096
 static uint64_t s_man_keys[KG_MAN_MAX];
@@ -609,26 +612,54 @@ static void manifest_note_record(void *ctx, const uint32_t *hdr, const uint32_t 
     manifest_note(((uint64_t)hdr[1] << 32) | hdr[2]);
 }
 
+/* Keep the complete prefix, then replace any interrupted header or payload with the new record.
+ * Scan the file we actually opened: it may have changed since the initial manifest_read. */
+static bool manifest_append(const KGpuVs *e)
+{
+    char path[512];
+    uint32_t hdr[4], words[NV2A_MAX_TRANSFORM_PROGRAM_LENGTH * VSH_TOKEN_SIZE];
+    long valid = 0, end;
+    bool present = false, ok = false;
+    FILE *f;
+    manifest_path(path, sizeof(path));
+    f = fopen(path, "r+b");
+    if (!f && errno == ENOENT) f = fopen(path, "w+b");
+    if (!f) return false;
+    for (;;) {
+        size_t n = fread(hdr, 1, sizeof(hdr), f);
+        if (!n) break;
+        if (n != sizeof(hdr) || hdr[0] != KG_MAN_MAGIC || !hdr[3] || hdr[3] % VSH_TOKEN_SIZE ||
+            hdr[3] > NV2A_MAX_TRANSFORM_PROGRAM_LENGTH * VSH_TOKEN_SIZE) break;
+        if (fread(words, sizeof(words[0]), hdr[3], f) != hdr[3]) break;
+        valid = ftell(f);
+        if (valid < 0) goto done;
+        if (hdr[1] == e->sh && hdr[2] == e->len) present = true;
+    }
+    /* An I/O error is not evidence that the existing bytes are an incomplete record. */
+    if (ferror(f) || fseek(f, 0, SEEK_END) || (end = ftell(f)) < 0) goto done;
+    if (end != valid && _chsize_s(_fileno(f), valid)) goto done;
+    if (fseek(f, valid, SEEK_SET)) goto done;
+    if (!present) {
+        hdr[0] = KG_MAN_MAGIC; hdr[1] = e->sh; hdr[2] = e->len; hdr[3] = e->nwords;
+        if (fwrite(hdr, sizeof(hdr), 1, f) != 1 ||
+            fwrite(e->words, sizeof(e->words[0]), e->nwords, f) != e->nwords || fflush(f)) goto done;
+    }
+    ok = true;
+done:
+    if (fclose(f)) ok = false;
+    return ok;
+}
+
 static void manifest_add(const KGpuVs *e)
 {
     uint64_t key = ((uint64_t)e->sh << 32) | e->len;
-    if (!e->words || !e->nwords) return;
+    if (!e->words || !e->nwords || e->nwords % VSH_TOKEN_SIZE ||
+        e->nwords > NV2A_MAX_TRANSFORM_PROGRAM_LENGTH * VSH_TOKEN_SIZE) return;
     AcquireSRWLockExclusive(&s_man_lock);
     if (!s_man_loaded) { manifest_read(manifest_note_record, NULL); s_man_loaded = true; }
     if (!manifest_has(key) && s_man_n < KG_MAN_MAX) {
-        char path[512];
-        FILE *f;
-        uint32_t hdr[4];
-        hdr[0] = KG_MAN_MAGIC; hdr[1] = e->sh; hdr[2] = e->len; hdr[3] = e->nwords;
         CreateDirectoryA(kg_cache_dir(), NULL);
-        manifest_path(path, sizeof(path));
-        f = fopen(path, "ab");
-        if (f) {
-            fwrite(hdr, 4, 4, f);
-            fwrite(e->words, 4, e->nwords, f);
-            fclose(f);
-            s_man_keys[s_man_n++] = key;
-        }
+        if (manifest_append(e)) manifest_note(key);
     }
     ReleaseSRWLockExclusive(&s_man_lock);
 }

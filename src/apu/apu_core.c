@@ -743,6 +743,31 @@ static void se_frame(MCPXAPUState *d)
  * APU frame thread (background processing)
  * ============================================================ */
 
+/* The frame thread keeps d->lock across up to eight frames between its waits
+ * (throttle waits once per eight), and a title thread writing a PIO method
+ * waited for all of them: about a quarter of BLACK's main thread in busy
+ * scenes. Between frames, a waiting writer gets the lock: the method still
+ * runs at once, in order, as before, after at most one frame instead of
+ * eight. RECOMP_APU_PIO_HANDOFF=0 keeps the lock across the frames. */
+extern volatile LONG g_apu_pio_waiters;
+
+static void mcpx_apu_pio_handoff(MCPXAPUState *d)
+{
+    static int on = -1;
+    int turns = 0;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_PIO_HANDOFF");
+        on = !(e && *e == '0');
+    }
+    if (!on || !InterlockedCompareExchange(&g_apu_pio_waiters, 0, 0))
+        return;
+    qemu_mutex_unlock(&d->lock);
+    /* bounded: a title writing methods back to back must not starve the audio */
+    while (InterlockedCompareExchange(&g_apu_pio_waiters, 0, 0) && turns++ < 64)
+        SwitchToThread();
+    qemu_mutex_lock(&d->lock);
+}
+
 /* How the frame thread spends its frames, for a hang report: running the
  * voice processor, or only the monitor because the front end is off, halted
  * or trapped. */
@@ -845,6 +870,7 @@ static void *mcpx_apu_frame_thread(void *arg)
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
             g_apu_frames_full++;
             se_frame(d);
+            mcpx_apu_pio_handoff(d);
         } else {
             g_apu_frames_monitor++;
             /* No DSP wrote this tick. Preserve earlier native slices if

@@ -817,6 +817,17 @@ static int m_queue[32], m_qhead, m_qtail;
 static volatile LONG m_active;
 static ULONGLONG m_active_tick;
 static Display m_display, m_scratch;     /* m_display under m_lock; m_scratch is the game thread's */
+/* Where each item of the shown page is, for the pointer: in menu units, written by build (game thread) into
+ * m_hit_scratch and published with the display list. kind is IT_*, split the x where a click changes meaning
+ * (OFF of a toggle, the lit end of a slider), or 0. m_xf maps menu units to client pixels (presenter thread). */
+typedef struct Hit { float x0, y0, x1, y1, split; int kind, ok; } Hit;
+static Hit m_hit[PCM_ITEMS], m_hit_scratch[PCM_ITEMS];
+static int m_hit_n, m_hit_scratch_n;
+static float m_xf_ox, m_xf_oy, m_xf_s;
+static int m_pointer_item = -1, m_pointer_known;
+static int m_pointer_x, m_pointer_y;     /* saved client pixels, also valid after a page change or resize */
+static float m_pointer_mx;
+#define PCM_ACT_HOVER 64                 /* + item index: the pointer moved onto that item */
 static unsigned m_generation;
 /* The presenter asks for the overlay every frame it shows. A native page needs it (it is what draws the page and
  * installs the input filter): without it -- the game started without the presenter window -- pages stay the game's. */
@@ -826,6 +837,24 @@ static volatile LONG m_input_seen;         /* the player used a page since pc_me
 static volatile LONG m_movie_skip_prompt;
 static const uint64_t *m_replaced;         /* earlier built-in definitions (FNV-1a 64 of the file) */
 static int m_nreplaced;
+
+/* m_lock held: clicks always use the currently published rows and window mapping. */
+static void pointer_hit_locked(void)
+{
+    float my;
+    int i;
+    m_pointer_item = -1;
+    if (!m_pointer_known || m_xf_s <= 0) return;
+    m_pointer_mx = ((float)m_pointer_x - m_xf_ox) / m_xf_s;
+    my = ((float)m_pointer_y - m_xf_oy) / m_xf_s;
+    for (i = 0; i < m_hit_n; i++) {
+        const Hit *h = &m_hit[i];
+        if (h->ok && m_pointer_mx >= h->x0 && m_pointer_mx < h->x1 && my >= h->y0 && my < h->y1) {
+            m_pointer_item = i;
+            break;
+        }
+    }
+}
 
 static double now_s(void)
 {
@@ -1701,6 +1730,23 @@ static void build(Display *d, const PcMenuHost *host, const Page *p, int ready, 
         if (item_visible(host, &p->item[i])) y += p->step + (p->item[i].kind == IT_SLIDER ? 37.0f : 0.0f);   /* a slider's bar */
         else ys[i] = -1;
     }
+    m_hit_scratch_n = p->nitem;
+    for (i = 0; i < p->nitem; i++) {
+        /* the selector bar's area (and a slider's row of bullets below it) */
+        Hit *h = &m_hit_scratch[i];
+        const Item *it = &p->item[i];
+        const float bw = p->bar_w > 0 ? p->bar_w : 300.0f;
+        h->ok = ys[i] >= 0 && !loading && item_focusable(host, it);
+        h->kind = it->kind;
+        h->x0 = p->list_x - 7; h->x1 = h->x0 + bw;
+        /* a row's values belong to it even where a narrow selector does not reach them */
+        if (it->kind == IT_TOGGLE && p->col2 > 0 && p->col2 + 60.0f > h->x1) h->x1 = p->col2 + 60.0f;
+        if (p->values_x > 0 && p->values_x + 8.0f > h->x1) h->x1 = p->values_x + 8.0f;
+        h->y0 = ys[i] - 8; h->y1 = ys[i] + 18 + (it->kind == IT_SLIDER ? 37.0f : 0.0f);
+        h->split = 0;
+        if (it->kind == IT_TOGGLE && p->col2 > p->col1) h->split = p->col2 - 6.0f;
+        else if (it->kind == IT_SLIDER && it->step > 0) h->split = p->list_x - 2 + (float)((m_slider[i] - it->lo) / it->step) * 10.0f;
+    }
     {   /* the selector: a dark bar behind the focused item, brackets at its ends, lines out to the rail and the edge */
         const float u = st->anim > 0 ? ease((float)((t - m_focus_t0) / st->anim)) : 1.0f;
         if (m_focus >= 0 && m_focus < p->nitem && ys[m_focus] >= 0 && !loading) {
@@ -1909,6 +1955,9 @@ int pc_menu_tick(const char *page, int ready, const PcMenuHost *host)
         m_depth = 0;                                /* subpages leave with their underlying game page */
         m_focus = m_prev_focus = -1;
         m_page_t0 = t;
+        AcquireSRWLockExclusive(&m_lock);
+        m_hit_n = 0; m_pointer_item = -1;
+        ReleaseSRWLockExclusive(&m_lock);
         if (idx >= 0) {
             p = &m_doc->page[idx];
             m_page = idx;
@@ -1954,6 +2003,15 @@ int pc_menu_tick(const char *page, int ready, const PcMenuHost *host)
             if (m_page < 0) continue;
             p = &m_doc->page[m_page];
             first_focus(host, p, t);
+            if (actions[i] >= PCM_ACT_HOVER && actions[i] < PCM_ACT_HOVER + PCM_ITEMS) {
+                const int target = actions[i] - PCM_ACT_HOVER;
+                if (!InterlockedCompareExchange(&m_capture, 0, 0) &&
+                    target < p->nitem && target != m_focus && item_focusable(host, &p->item[target])) {
+                    play(host, "SNDChange");
+                    set_focus(host, p, target, t);
+                }
+                continue;
+            }
             apply(host, p, actions[i], t);
             if ((actions[i] == PCM_ACT_CONFIRM || actions[i] == PCM_ACT_BACK || actions[i] == PCM_ACT_START) &&
                 !InterlockedCompareExchange(&m_capture, 0, 0))
@@ -1978,6 +2036,9 @@ int pc_menu_tick(const char *page, int ready, const PcMenuHost *host)
         memcpy(m_display.prim, m_scratch.prim, sizeof(Prim) * (size_t)m_scratch.n);
         m_generation++;
     }
+    memcpy(m_hit, m_hit_scratch, sizeof(m_hit));
+    m_hit_n = m_hit_scratch_n;
+    pointer_hit_locked();
     ReleaseSRWLockExclusive(&m_lock);
     m_active_tick = GetTickCount64();
     if (!InterlockedExchange(&m_active, 1)) pc_video_menu_hide_hint(1);
@@ -2017,6 +2078,13 @@ int pc_menu_active(void)
 static void queue(int action)
 {
     AcquireSRWLockExclusive(&m_lock);
+    /* Mouse motion can report the same row repeatedly before the game polls. Keep one hover so clicks
+     * still have room, while a real new motion can re-focus a row after a page or keyboard change. */
+    if (action >= PCM_ACT_HOVER && action < PCM_ACT_HOVER + PCM_ITEMS && m_qhead != m_qtail &&
+        m_queue[(m_qtail + 31) % 32] == action) {
+        ReleaseSRWLockExclusive(&m_lock);
+        return;
+    }
     if ((m_qtail + 1) % 32 != m_qhead) { m_queue[m_qtail] = action; m_qtail = (m_qtail + 1) % 32; }
     ReleaseSRWLockExclusive(&m_lock);
 }
@@ -2091,10 +2159,37 @@ static int f_button(int button, int down)
         const LONG cap = InterlockedCompareExchange(&m_capture, 0, 0);
         input_seen();
         if (cap) { if (cap == CAP_KEY) queue(ACT_KEY | (int)PC_SOURCE_MOUSE(button)); }
-        else if (button == 0) queue(PCM_ACT_CONFIRM);
-        else if (button == 1) queue(PCM_ACT_BACK);
+        else if (button == 0) {
+            int item, kind = IT_BUTTON, act = PCM_ACT_CONFIRM;
+            AcquireSRWLockExclusive(&m_lock);
+            pointer_hit_locked();
+            item = m_pointer_known ? m_pointer_item : -2;    /* -2: no pointer yet, the keyboard's confirm */
+            if (item >= 0 && item < m_hit_n) {
+                const Hit *h = &m_hit[item];
+                kind = h->kind;
+                if (kind == IT_TOGGLE && h->split > 0) act = m_pointer_mx >= h->split ? PCM_ACT_RIGHT : PCM_ACT_LEFT;
+                else if (kind == IT_SLIDER) act = m_pointer_mx >= h->split ? PCM_ACT_RIGHT : PCM_ACT_LEFT;
+            }
+            ReleaseSRWLockExclusive(&m_lock);
+            if (item >= 0) { queue(PCM_ACT_HOVER + item); queue(act); }
+            else if (item == -2) queue(PCM_ACT_CONFIRM);
+        } else if (button == 1) queue(PCM_ACT_BACK);
     }
     return take;
+}
+
+void pc_menu_pointer(int x, int y)
+{
+    int item;
+    if (!pc_menu_active()) return;
+    AcquireSRWLockExclusive(&m_lock);
+    if (m_xf_s <= 0) { ReleaseSRWLockExclusive(&m_lock); return; }
+    m_pointer_x = x; m_pointer_y = y;
+    m_pointer_known = 1;
+    pointer_hit_locked();
+    item = m_pointer_item;
+    ReleaseSRWLockExclusive(&m_lock);
+    if (item >= 0) { input_seen(); queue(PCM_ACT_HOVER + item); }
 }
 
 static int f_wheel(int delta)
@@ -2553,6 +2648,14 @@ static int page_overlay(unsigned w, unsigned h, int px, int py, unsigned pw, uns
     Box boxes[PCM_BOXES];
     m_overlay_seen = GetTickCount64();
     m_dirty.x0 = m_dirty.y0 = m_dirty.x1 = m_dirty.y1 = 0;
+    if (pw && ph) {
+        Canvas xf;
+        canvas_for(&xf, NULL, w, h, px, py, pw, ph);
+        AcquireSRWLockExclusive(&m_lock);
+        m_xf_ox = xf.ox; m_xf_oy = xf.oy; m_xf_s = xf.s;
+        pointer_hit_locked();
+        ReleaseSRWLockExclusive(&m_lock);
+    }
     video_on = pc_video_menu_overlay(w, h, &video, &video_changed);
     menu_on = pc_menu_active();
     if (!menu_on) {
@@ -2869,6 +2972,8 @@ void pc_menu_test_reset(const char *definition)
     m_generation++;
     ReleaseSRWLockExclusive(&m_lock);
     m_page = -1; m_page_name[0] = 0; m_focus = m_prev_focus = -1; m_depth = 0;
+    m_hit_n = m_hit_scratch_n = 0; m_pointer_item = -1; m_pointer_known = 0; m_xf_s = 0;
+    m_button_swallowed = 0;
     m_disabled = 0;
     InterlockedExchange(&m_input_seen, 0);
     pc_menu_set_movie_skip_prompt(0);
@@ -2900,6 +3005,19 @@ int pc_menu_test_render(uint32_t *pixels, unsigned w, unsigned h)
     free(d);
     return 1;
 }
+
+void pc_menu_test_pointer_space(unsigned w, unsigned h)
+{
+    Canvas xf;
+    canvas_for(&xf, NULL, w, h, 0, 0, w, h);
+    AcquireSRWLockExclusive(&m_lock);
+    m_xf_ox = xf.ox; m_xf_oy = xf.oy; m_xf_s = xf.s;
+    pointer_hit_locked();
+    ReleaseSRWLockExclusive(&m_lock);
+}
+
+void pc_menu_test_button(int button, int down) { f_button(button, down); }
+int pc_menu_test_pointer_item(void) { return m_pointer_item; }
 
 size_t pc_menu_test_dump(char *out, size_t cap)
 {
@@ -2948,5 +3066,9 @@ void pc_menu_request_video(void) {}
 int pc_menu_test_focus(void) { return -1; }
 int pc_menu_test_load_file(const char *path) { (void)path; return 0; }
 int pc_menu_test_render(uint32_t *p, unsigned w, unsigned h) { (void)p; (void)w; (void)h; return 0; }
+void pc_menu_pointer(int x, int y) { (void)x; (void)y; }
+void pc_menu_test_pointer_space(unsigned w, unsigned h) { (void)w; (void)h; }
+void pc_menu_test_button(int button, int down) { (void)button; (void)down; }
+int pc_menu_test_pointer_item(void) { return -1; }
 size_t pc_menu_test_dump(char *out, size_t cap) { (void)out; (void)cap; return 0; }
 #endif

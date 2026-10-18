@@ -712,6 +712,8 @@ uint64_t mcpx_apu_vp_read(void *opaque, hwaddr addr, unsigned int size)
     return 0;
 }
 
+extern volatile LONG g_apu_pio_waiters;
+
 void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val,
                         unsigned int size)
 {
@@ -722,10 +724,15 @@ void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val,
      * calls arrive from several host threads, unlike the original CPU, and
      * must not race that publication or one another. The shim's mutex is
      * recursive, as VOICE_LOCK also takes it. */
+    InterlockedIncrement(&g_apu_pio_waiters);
     qemu_mutex_lock(&d->lock);
+    InterlockedDecrement(&g_apu_pio_waiters);
     fe_method(d, (uint32_t)addr, (uint32_t)val);
     qemu_mutex_unlock(&d->lock);
 }
+
+/* Title threads waiting for d->lock to write a PIO method (see mcpx_apu_pio_handoff). */
+volatile LONG g_apu_pio_waiters;
 
 /* ============================================================
  * SGE data pointer resolution

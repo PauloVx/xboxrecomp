@@ -452,6 +452,10 @@ static int fb_input_message(HWND hwnd, UINT m, WPARAM w, LPARAM l, LRESULT *resu
     case WM_MOUSEWHEEL:
         pc_input_wheel_event(GET_WHEEL_DELTA_WPARAM(w));
         *result = 0; return 1;
+    case WM_MOUSEMOVE:
+        /* a native menu page follows the free pointer (gameplay captures it and reads raw motion instead) */
+        if (!s_ui_captured) pc_menu_pointer((int)(short)LOWORD(l), (int)(short)HIWORD(l));
+        return 0;
     case WM_INPUT: {
         RAWINPUT raw = {0}; UINT size = sizeof(raw);
         UINT received = GetRawInputData((HRAWINPUT)l, RID_INPUT, &raw, &size, sizeof(RAWINPUTHEADER));

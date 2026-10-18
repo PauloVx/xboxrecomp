@@ -2382,6 +2382,46 @@ static DWORD kernel_vblank_wait_ms(DWORD limit)
     return left < (LONGLONG)limit ? (DWORD)left : limit;
 }
 
+/* RECOMP_VBLANK_KEEP_GRID=1: missed vblanks are owed, not dropped (see
+ * kernel_vblank_tick). RECOMP_VBLANK_STATS=1 prints, every five seconds,
+ * how many vblanks were delivered, how many came late to repay a stall,
+ * how many were dropped and how often the grid restarted. */
+static int s_vblank_keep_grid = -1, s_vblank_stats;
+static LONGLONG s_vblank_grid, s_vstat_since;
+static unsigned s_vstat_delivered, s_vstat_owed, s_vstat_dropped, s_vstat_restarts;
+
+static void vblank_keep_grid_init(void)
+{
+    const char *e, *s;
+    if (s_vblank_keep_grid >= 0)
+        return;
+    e = getenv("RECOMP_VBLANK_KEEP_GRID");
+    s = getenv("RECOMP_VBLANK_STATS");
+    s_vblank_keep_grid = e && *e && *e != '0';
+    s_vblank_stats = s && *s && *s != '0';
+    if (s_vblank_keep_grid)
+        fprintf(stderr, "[VBLANK] keeping the grid: vblanks missed in a stall are delivered late, not dropped\n");
+}
+
+static void kernel_vblank_stats(LONGLONG now)
+{
+    LARGE_INTEGER f;
+    if (!s_vblank_stats)
+        return;
+    if (!s_vstat_since) {
+        s_vstat_since = now;
+        return;
+    }
+    QueryPerformanceFrequency(&f);
+    if (now - s_vstat_since < 5 * f.QuadPart)
+        return;
+    fprintf(stderr, "[VBLANK] %.2f/s delivered (%u late to repay a stall), %u dropped, %u grid restarts\n",
+            (double)s_vstat_delivered * (double)f.QuadPart / (double)(now - s_vstat_since),
+            s_vstat_owed, s_vstat_dropped, s_vstat_restarts);
+    s_vstat_delivered = s_vstat_owed = s_vstat_dropped = s_vstat_restarts = 0;
+    s_vstat_since = now;
+}
+
 static void kernel_vblank_tick(void)
 {
     LARGE_INTEGER now;
@@ -2390,13 +2430,37 @@ static void kernel_vblank_tick(void)
         return;
 
     QueryPerformanceCounter(&now);
+    vblank_keep_grid_init();
+    kernel_vblank_stats(now.QuadPart);
     if (now.QuadPart < s_vblank_next)
         return;
-    /* The next one on the 60 Hz grid; after a stall, restart the grid from
-     * now rather than delivering the missed ones in a burst. */
-    s_vblank_next += s_vblank_period;
-    if (s_vblank_next <= now.QuadPart)
-        s_vblank_next = now.QuadPart + s_vblank_period;
+    ++s_vstat_delivered;
+    if (s_vblank_keep_grid) {
+        /* Keep the grid through a short stall of this thread (a GPU lock
+         * held for a while, a slow DPC): the vblanks it missed follow at a
+         * quarter period apart, so a title that steps its world once per
+         * vblank-paced flip stays at real time. A stall of more than four
+         * periods is a real interruption and restarts the grid as below. */
+        s_vblank_grid += s_vblank_period;
+        if (s_vblank_grid <= now.QuadPart - 4 * s_vblank_period) {
+            s_vblank_grid = now.QuadPart + s_vblank_period;
+            ++s_vstat_restarts;
+        }
+        s_vblank_next = s_vblank_grid;
+        if (s_vblank_next <= now.QuadPart) {
+            s_vblank_next = now.QuadPart + s_vblank_period / 4;
+            ++s_vstat_owed;
+        }
+    } else {
+        /* The next one on the 60 Hz grid; after a stall, restart the grid from
+         * now rather than delivering the missed ones in a burst. */
+        s_vblank_next += s_vblank_period;
+        if (s_vblank_next <= now.QuadPart) {
+            s_vstat_dropped += (unsigned)((now.QuadPart - s_vblank_next) / s_vblank_period) + 1u;
+            s_vblank_next = now.QuadPart + s_vblank_period;
+            ++s_vstat_restarts;
+        }
+    }
 
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;

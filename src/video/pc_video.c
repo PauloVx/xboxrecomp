@@ -184,6 +184,9 @@ static int apply_key(PcVideoSettings *s, const char *key, const char *value)
     } else if (!_stricmp(key, "motion_blur")) {
         if (!_stricmp(value, "off")) { s->motion_blur_off = 1; return 1; }
         if (!_stricmp(value, "original")) { s->motion_blur_off = 0; return 1; }
+    } else if (!_stricmp(key, "action_blur")) {
+        if (!_stricmp(value, "off")) { s->action_blur_off = 1; return 1; }
+        if (!_stricmp(value, "original")) { s->action_blur_off = 0; return 1; }
     } else if (!_stricmp(key, "aa")) {
         int a = name_index(k_aa_names, PCV_AA_COUNT, value);
         if (a >= 0) { s->aa = (unsigned)a; return 1; }
@@ -265,6 +268,7 @@ size_t pc_video_format(const PcVideoSettings *s, char *out, size_t cap)
         "aspect=%s\n"
         "fov=%g\n"
         "motion_blur=%s\n"
+        "action_blur=%s\n"
         "aa=%s\n"
         "af=%u\n"
         "dof=%s\n"
@@ -281,6 +285,7 @@ size_t pc_video_format(const PcVideoSettings *s, char *out, size_t cap)
         s->scale == PCV_SCALE_STRETCH ? "stretch" : s->scale == PCV_SCALE_INTEGER ? "integer" : "fit",
         s->nearest ? "nearest" : "linear", s->vsync ? 1u : 0u, s->fps_limit,
         pc_video_aspect_name(s->aspect), s->fov, s->motion_blur_off ? "off" : "original",
+        s->action_blur_off ? "off" : "original",
         k_aa_names[s->aa < PCV_AA_COUNT ? s->aa : 0], s->af, k_step_names[s->dof < PCV_STEP_COUNT ? s->dof : 0],
         k_step_names[s->sharpen < PCV_STEP_COUNT ? s->sharpen : 0],
         k_ao_names[s->ao_method < PCV_AO_COUNT ? s->ao_method : PCV_AO_OFF],
